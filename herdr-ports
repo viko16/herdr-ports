@@ -27,7 +27,6 @@
 # via termios VMIN=0/VTIME=1 (stty + dd) so a bare Escape quits in ~0.1s.
 set -u
 
-HERDR="${HERDR_BIN_PATH:-herdr}"
 # U+21AF lightning: monochrome, single-width, no emoji variant. Nerd Font
 # glyphs (e.g. the U+F1E6 plug) are not an option: herdr silently strips
 # Private Use Area characters from metadata tokens.
@@ -155,14 +154,14 @@ watch_loop() {
 	# The TTL is only a backstop (a missed poll must not flicker the badge, and a
 	# dead watcher must still let the badge lapse). The fast path is an explicit
 	# diff: any Space that lost its last listener since the previous poll gets a
-	# --clear-token immediately, so a server killed outside the popup drops its
-	# badge within one INTERVAL instead of waiting out the TTL.
+	# clear immediately, so a server killed outside the popup drops its badge
+	# within one INTERVAL instead of waiting out the TTL.
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
 	validate_watch_options || return $?
 	local renew=$((INTERVAL * 2)) ttl=$(((INTERVAL * 3 + 10) * 1000))
-	local ws now cur leases='' next last known stamp cache_dir
+	local ws now cur leases='' next last known stamp cache_dir ops successes
 	cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-watch.XXXXXX") || return 1
 	trap 'exit 0' TERM INT HUP
 	while :; do
@@ -172,6 +171,31 @@ watch_loop() {
 			sleep "$INTERVAL" || return 1
 			continue
 		fi
+
+		# Build the complete write set first, then send it through one Python
+		# helper invocation. Each workspace still uses its own Herdr socket
+		# connection, matching the server's one-request-per-connection protocol.
+		ops=''
+		for ws in $cur; do
+			last=''
+			while read -r known stamp; do
+				if [ "$known" = "$ws" ]; then last=$stamp; break; fi
+			done <<< "$leases"
+			if [ -z "$last" ] || [ "$now" -lt "$last" ] || [ "$((now - last))" -ge "$renew" ]; then
+				ops="$ops"$'set\t'"$ws"$'\n'
+			fi
+		done
+		while read -r ws last; do
+			[ -n "$ws" ] || continue
+			case $'\n'"$cur"$'\n' in *$'\n'"$ws"$'\n'*) continue ;; esac
+			ops="$ops"$'clear\t'"$ws"$'\n'
+		done <<< "$leases"
+
+		successes=''
+		if [ -n "$ops" ]; then
+			successes=$(python3 "$PROCESS_HELPER" metadata "$now" "$ttl" "$BADGE" <<< "$ops") || successes=''
+		fi
+
 		next=''
 		for ws in $cur; do
 			last=''
@@ -179,10 +203,7 @@ watch_loop() {
 				if [ "$known" = "$ws" ]; then last=$stamp; break; fi
 			done <<< "$leases"
 			if [ -z "$last" ] || [ "$now" -lt "$last" ] || [ "$((now - last))" -ge "$renew" ]; then
-				if "$HERDR" workspace report-metadata "$ws" --source ports \
-					--token ports="$BADGE" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1; then
-					last=$now
-				fi
+				case $'\n'"$successes"$'\n' in *$'\n'"set $ws"$'\n'*) last=$now ;; esac
 			fi
 			# Also remember failed first posts: a lost response may have applied.
 			next="$next$ws ${last:-0}"$'\n'
@@ -190,10 +211,10 @@ watch_loop() {
 		while read -r ws last; do
 			[ -n "$ws" ] || continue
 			case $'\n'"$cur"$'\n' in *$'\n'"$ws"$'\n'*) continue ;; esac
-			if ! "$HERDR" workspace report-metadata "$ws" \
-				--source ports --clear-token ports --seq "$now" > /dev/null 2>&1; then
-				next="$next$ws $last"$'\n'
-			fi
+			case $'\n'"$successes"$'\n' in
+				*$'\n'"clear $ws"$'\n'*) continue ;;
+			esac
+			next="$next$ws $last"$'\n'
 		done <<< "$leases"
 		leases=$next
 		sleep "$INTERVAL" || return 1
@@ -256,7 +277,7 @@ cursor_down() {
 # child, and clear the sidebar badge for Spaces that just lost their last
 # listener rather than waiting out the metadata TTL. Outcome -> $status (footer).
 kill_targets() {
-	local targets='' i pid killed='' remaining='' before after ws
+	local targets='' i pid killed='' remaining='' before after ws clears='' clear_now
 	for ((i = 1; i <= n; i++)); do
 		[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
 	done
@@ -286,9 +307,12 @@ kill_targets() {
 	# watcher posted this exact second, in which case the TTL is the backstop)
 	after=$(active_workspaces) || { status='Unable to refresh services'; needs_refresh=1; return 1; }
 	for ws in $(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after")); do
-		[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
-			--source ports --clear-token ports --seq "$(date +%s)" > /dev/null 2>&1
+		[ -n "$ws" ] && clears="$clears"$'clear\t'"$ws"$'\n'
 	done
+	if [ -n "$clears" ]; then
+		clear_now=$(date +%s)
+		python3 "$PROCESS_HELPER" metadata "$clear_now" - "$BADGE" <<< "$clears" > /dev/null 2>&1 || true
+	fi
 	status="TERM →$killed"
 	[ -n "$remaining" ] && status="$status · KILL →$remaining"
 	needs_refresh=1
