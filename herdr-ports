@@ -34,7 +34,8 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 # glyphs (e.g. the U+F1E6 plug) are not an option: herdr silently strips
 # Private Use Area characters from metadata tokens.
 BADGE="${HERDR_PORTS_BADGE:-↯}"
-INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
+INTERVAL="${HERDR_PORTS_INTERVAL-5}"
+WORKSPACE_INTERVAL="${HERDR_PORTS_WORKSPACE_INTERVAL-15}"
 # 256-color index for the primary CTA chip, mimicking herdr's native accent
 # buttons (223 ~ vesper's peach). Panes render with the terminal palette, not
 # herdr's theme, so the exact accent cannot be queried - override to match.
@@ -45,7 +46,8 @@ ACCENT="${HERDR_PORTS_ACCENT:-223}"
 # walks every fd of every process): macOS netstat reads the whole TCP pcblist
 # in a single sysctl and carries a process:pid column; Linux ss asks netlink
 # inet_diag. lsof remains the universal fallback.
-pid_ports() {
+pid_ports() (
+	set -o pipefail
 	if [ "$(uname 2> /dev/null)" = Darwin ] && command -v netstat > /dev/null 2>&1; then
 		# The process:pid token is located from the right: macOS addresses put
 		# a "." before the port, so a field ending in ":digits" can only be
@@ -69,16 +71,25 @@ pid_ports() {
 			}
 		' | sort -u
 	elif command -v lsof > /dev/null 2>&1; then
-		lsof -nP -iTCP -sTCP:LISTEN -Fpn 2> /dev/null | awk '
+		# lsof uses status 1 with no output for a successful empty selection.
+		local output status=0
+		output=$(lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>&1) || status=$?
+		[ "$status" -eq 1 ] && [ -z "$output" ] && return 0
+		[ "$status" -le 1 ] || return "$status"
+		printf '%s\n' "$output" | awk -v status="$status" '
 			/^p/ { pid = substr($0, 2) }
-			/^n/ { port = $0; sub(/.*:/, "", port); if (port ~ /^[0-9]+$/) print pid "\t" port }
+			/^n/ { port = $0; sub(/.*:/, "", port); if (pid ~ /^[0-9]+$/ && port ~ /^[0-9]+$/) { print pid "\t" port; seen = 1 } }
+			END { if (status && !seen) exit 1 }
 		' | sort -u
+	else
+		return 1
 	fi
-}
+)
 
 # stdin: "pid<TAB>..." lines -> "pid<TAB>cwd". Roots ("/") are dropped: system
 # daemons live there and would otherwise match every workspace.
-pid_cwds() {
+pid_cwds() (
+	set -o pipefail
 	local pids pid cwd
 	pids=$(cut -f1 | sort -un)
 	[ -n "$pids" ] || return 0
@@ -89,23 +100,35 @@ pid_cwds() {
 			printf '%s\t%s\n' "$pid" "$cwd"
 		done
 	else
-		lsof -a -d cwd -p "$(printf '%s\n' $pids | paste -s -d, -)" -Fpn 2> /dev/null | awk '
+		local output status=0
+		output=$(lsof -a -d cwd -p "$(printf '%s\n' $pids | paste -s -d, -)" -Fpn 2> /dev/null) || status=$?
+		[ "$status" -le 1 ] || return "$status"
+		# A disappearing/inaccessible PID makes batch lsof exit 1 even when
+		# other PIDs have valid cwds. Keep those records, but reject a failed
+		# read with no complete records so it cannot clear every badge.
+		printf '%s\n' "$output" | awk -v status="$status" '
 			/^p/ { pid = substr($0, 2) }
-			/^n/ { cwd = substr($0, 2); if (cwd != "/") print pid "\t" cwd }
+			/^n/ { cwd = substr($0, 2); if (pid ~ /^[0-9]+$/ && cwd != "") { seen = 1; if (cwd != "/") print pid "\t" cwd } }
+			END { if (status && !seen) exit 1 }
 		'
 	fi
-}
+)
 
-# "workspace_id<TAB>cwd" for every pane (empty when the herdr server is down)
-workspace_cwds() {
-	"$HERDR" api snapshot 2> /dev/null | jq -r '
+# "workspace_id<TAB>cwd" for every pane; failed reads return nonzero.
+workspace_cwds() (
+	set -o pipefail
+	"$HERDR" api snapshot 2> /dev/null | jq -sr '
+		if length != 1 then error("missing snapshot") else .[0] end
+		| if type != "object" and type != "array" then error("invalid snapshot") else . end
+		| if type == "object" and (.error? != null or .ok? == false) then error("snapshot failed") else . end
+		|
 		.. | objects | select(has("pane_id") and has("workspace_id"))
 		| .workspace_id as $w
 		| ([.cwd?, .foreground_cwd?] | unique | .[])
 		| select(type == "string" and . != "" and . != "/")
 		| "\($w)\t\(.)"
 	' 2> /dev/null | sort -u
-}
+)
 
 # "workspace_id<TAB>label"
 workspace_labels() {
@@ -121,7 +144,7 @@ workspace_labels() {
 # claim every workspace under it.
 match_join() {
 	awk -F'\t' -v home="$HOME" '
-		NR == FNR { wsid[NR] = $1; wcwd[NR] = $2; n = NR; next }
+		FILENAME == ARGV[1] { if (NF >= 2) { n++; wsid[n] = $1; wcwd[n] = $2 }; next }
 		{
 			for (i = 1; i <= n; i++) {
 				w = wcwd[i]
@@ -140,45 +163,104 @@ active_workspaces() {
 	pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u
 }
 
-pidfile_path() {
-	echo "/tmp/herdr-ports-watcher.$(id -u).pid"
+validate_watch_options() {
+	local value
+	for value in "$INTERVAL" "$WORKSPACE_INTERVAL"; do
+		case "$value" in
+			'' | 0* | *[!0-9]*) echo 'poll intervals must be integers from 1 to 3600 seconds' >&2; return 2 ;;
+		esac
+		[ "${#value}" -le 4 ] && [ "$value" -le 3600 ] || {
+			echo 'poll intervals must be integers from 1 to 3600 seconds' >&2
+			return 2
+		}
+	done
 }
 
-watcher_alive() {
-	local pidfile
-	pidfile=$(pidfile_path)
-	[ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2> /dev/null)" 2> /dev/null
+watch_singleton() {
+	validate_watch_options || return $?
+	local self
+	self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+	# Keep the inode: unlinking a locked file lets a new opener take a second
+	# lock. Kernel ownership handles crashes and PID reuse without signalling.
+	exec perl -MFcntl=:DEFAULT,:flock,F_SETFD -MDigest::SHA=sha256_hex -e '
+		my ($script, $socket) = @ARGV;
+		my $dir = "/tmp/herdr-ports-watch-$<";
+		unless (-d $dir) { mkdir($dir, 0700) or do { die "mkdir $dir: $!" unless $!{EEXIST}; }; }
+		my @d = lstat($dir);
+		die "unsafe lock directory" unless -d _ && !-l _ && $d[4] == $< && ($d[2] & 0777) == 0700;
+		my $path = "$dir/" . sha256_hex($socket) . ".lock";
+		sysopen(my $lock, $path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600) or die "open lock: $!";
+		my @s = stat($lock);
+		die "unsafe lock file" unless -f $lock && $s[4] == $< && $s[3] == 1;
+		unless (flock($lock, LOCK_EX | LOCK_NB)) {
+			exit 0 if $!{EWOULDBLOCK} || $!{EAGAIN};
+			die "flock: $!";
+		}
+		fcntl($lock, F_SETFD, 0) or die "fcntl: $!";
+		exec "/bin/bash", "-c", q{source "$1"; watch_loop}, "herdr-ports-watch", $script;
+		die "exec watcher: $!";
+	' "$self" "${HERDR_SOCKET_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock}"
 }
 
 watch_loop() {
-	watcher_alive && exit 0
-	echo $$ > "$(pidfile_path)"
-	trap 'rm -f "$(pidfile_path)"' EXIT
-
 	# The TTL is only a backstop (a missed poll must not flicker the badge, and a
 	# dead watcher must still let the badge lapse). The fast path is an explicit
 	# diff: any Space that lost its last listener since the previous poll gets a
 	# --clear-token immediately, so a server killed outside the popup drops its
-	# badge within one INTERVAL instead of waiting out the ~15s TTL.
+	# badge within one INTERVAL instead of waiting out the TTL.
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
-	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev=''
+	validate_watch_options || return $?
+	local renew=$((INTERVAL * 2)) ttl=$(((INTERVAL * 3 + 10) * 1000))
+	local ws now cur rows='' refreshed=0 fetched leases='' next last known stamp readable
+	trap 'exit 0' TERM INT HUP
 	while :; do
-		cur=$(active_workspaces)
 		now=$(date +%s)
+		readable=1
+		if [ "$refreshed" -eq 0 ] || [ "$now" -lt "$refreshed" ] || [ "$((now - refreshed))" -ge "$WORKSPACE_INTERVAL" ]; then
+			if fetched=$(workspace_cwds); then
+				rows=$fetched
+				refreshed=$now
+			else
+				# A failed read is not an empty snapshot. Keep lease state and
+				# retry next poll; TTL remains the backstop during an outage.
+				readable=0
+				refreshed=0
+			fi
+		fi
+		if ! cur=$(set -o pipefail; pid_ports | pid_cwds | match_join <(printf '%s\n' "$rows") | cut -f3 | sort -u); then
+			readable=0
+		fi
+		if [ "$readable" -eq 0 ]; then
+			sleep "$INTERVAL" || return 1
+			continue
+		fi
+		next=''
 		for ws in $cur; do
-			"$HERDR" workspace report-metadata "$ws" --source ports \
-				--token ports="$BADGE" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1
+			last=''
+			while read -r known stamp; do
+				if [ "$known" = "$ws" ]; then last=$stamp; break; fi
+			done <<< "$leases"
+			if [ -z "$last" ] || [ "$now" -lt "$last" ] || [ "$((now - last))" -ge "$renew" ]; then
+				if "$HERDR" workspace report-metadata "$ws" --source ports \
+					--token ports="$BADGE" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1; then
+					last=$now
+				fi
+			fi
+			# Also remember failed first posts: a lost response may have applied.
+			next="$next$ws ${last:-0}"$'\n'
 		done
-		# comm needs sorted input; active_workspaces already sorts -u, and prev
-		# is a prior cur, so both sides are sorted
-		for ws in $(comm -23 <(printf '%s\n' "$prev") <(printf '%s\n' "$cur")); do
-			[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
-				--source ports --clear-token ports --seq "$now" > /dev/null 2>&1
-		done
-		prev=$cur
-		sleep "$INTERVAL"
+		while read -r ws last; do
+			[ -n "$ws" ] || continue
+			case $'\n'"$cur"$'\n' in *$'\n'"$ws"$'\n'*) continue ;; esac
+			if ! "$HERDR" workspace report-metadata "$ws" \
+				--source ports --clear-token ports --seq "$now" > /dev/null 2>&1; then
+				next="$next$ws $last"$'\n'
+			fi
+		done <<< "$leases"
+		leases=$next
+		sleep "$INTERVAL" || return 1
 	done
 }
 
@@ -186,7 +268,7 @@ watch_loop() {
 # event never blocks herdr. $0 is resolved to an absolute path because the
 # detached child must not depend on the hook's cwd surviving.
 ensure_watch() {
-	watcher_alive && exit 0
+	validate_watch_options || return $?
 	local self
 	self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 	nohup "$self" watch > /dev/null 2>&1 &
@@ -525,8 +607,9 @@ popup() {
 	done
 }
 
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "${1:-}" in
-	watch) watch_loop ;;
+	watch) watch_singleton ;;
 	ensure-watch) ensure_watch ;;
 	list) list_mode ;;
 	'') popup ;;
@@ -535,3 +618,4 @@ case "${1:-}" in
 		exit 2
 		;;
 esac
+fi
