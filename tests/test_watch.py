@@ -35,7 +35,7 @@ def table():
 def sockets():
     return cfg.get("sockets", [[424242+i, 3000+i] for i in range(cfg.get("workspaces", 2))])
 if name == "python3":
-    import importlib.util
+    import importlib.util, io
     spec = importlib.util.spec_from_file_location("ports_processes", sys.argv[1])
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -51,6 +51,41 @@ if name == "python3":
                 raise OSError("denied")
             return {k.encode(): v.encode() for k, v in env.items()}
     module.KernelProcesses = Kernel
+    class Socket:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, value): pass
+        def connect(self, path):
+            assert path == os.environ["HERDR_SOCKET_PATH"]
+        def sendall(self, raw):
+            request = json.loads(raw)
+            method = request["method"]
+            with (p / "calls").open("a") as f:
+                f.write(json.dumps([tick, "rpc", [method]]) + "\n")
+            if method == "session.snapshot":
+                if tick in cfg.get("snapshot_fail", []): raise OSError("failed")
+                if tick in cfg.get("snapshot_empty_response", []):
+                    self.response = b""; return
+                if tick in cfg.get("snapshot_invalid", []):
+                    self.response = b"invalid\n"; return
+                panes = value("panes", [{"pane_id": "p"+str(i), "workspace_id": "w"+str(i),
+                    "terminal_id": "t"+str(i), "cwd": "/shared", "label": "Sidebar"}
+                    for i in range(cfg.get("workspaces", 2))])
+                result = {"snapshot": {"panes": panes, "workspaces":
+                    [{"workspace_id": "w"+str(i), "label": "space"+str(i)} for i in range(cfg.get("workspaces", 2))]}}
+            elif method == "pane.process_info":
+                if tick in cfg.get("info_fail", []): raise OSError("failed")
+                pane = request["params"]["pane_id"]
+                result = {"process_info": {"pane_id": pane, "shell_pid":
+                    value("shells", {}).get(pane, 10000 + int(pane[1:]))}}
+            else:
+                raise AssertionError("unexpected write method")
+            self.response = (json.dumps({"id": request["id"], "result": result}) + "\n").encode()
+        def makefile(self, mode): return io.BytesIO(self.response)
+    # Keep RPC counts separate from executable launches. Socket framing itself
+    # is also exercised against a real private Unix socket in test_processes.
+    if hasattr(module, "socket"):
+        module.socket.socket = lambda *args: Socket()
     sys.argv = sys.argv[1:]
     try:
         module.main()
@@ -142,8 +177,8 @@ class WatchTests(unittest.TestCase):
                    HERDR_PORTS_INTERVAL="5")
         return path, env
 
-    def run_watch(self, path, env):
-        result = subprocess.run(["/bin/bash", str(SCRIPT), "watch"], env=env,
+    def run_watch(self, path, env, script=SCRIPT):
+        result = subprocess.run(["/bin/bash", str(script), "watch"], env=env,
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 1, result.stderr)  # mock sleep ends run
         self.assertEqual(result.stderr, "")
@@ -161,34 +196,53 @@ class WatchTests(unittest.TestCase):
 
 
     def test_complete_stable_polling_budget(self):
-        path, env = self.fixture(polls=7, workspaces=4)
+        path, env = self.fixture(polls=7, workspaces=20)
         calls = self.run_watch(path, env)
         counts = collections.Counter(
             "snapshot" if name == "herdr" and args[:1] == ["api"] else
             "process-info" if name == "herdr" and args[:1] == ["pane"] else
             "metadata" if name == "herdr" else name for _, name, args in calls)
         self.assertEqual({key: counts[key] for key in ("python3", "ps", "netstat", "lsof", "snapshot", "process-info", "metadata")},
-                         dict(python3=7, ps=7, netstat=7, lsof=0, snapshot=7, **{"process-info": 12}, metadata=16))
-        self.assertEqual([t for t, a in self.reports(calls)][::4], [0, 2, 4, 6])
+                         dict(python3=7, ps=7, netstat=7, lsof=0, snapshot=0, **{"process-info": 0}, metadata=80))
+        self.assertEqual(collections.Counter(a[0] for _, n, a in calls if n == "rpc"),
+                         {"session.snapshot": 7, "pane.process_info": 20})
+        self.assertEqual([t for t, n, a in calls if n == "rpc" and a == ["pane.process_info"]], [0] * 20)
+        self.assertEqual([t for t, a in self.reports(calls)][::20], [0, 2, 4, 6])
         for _, args in self.reports(calls):
             self.assertEqual(args[args.index("--ttl-ms") + 1], "25000")
         # Include the singleton launcher's absolute Bash exec, not only PATH.
-        self.assertEqual(len(calls) + 1, 96)
-        print("\nComplete 7 polls / 4 panes budget:", dict(counts), "total:", len(calls) + 1,
-              "(previous measured implementation: 148)")
+        self.assertEqual(sum(n != "rpc" for _, n, _ in calls) + 1, 141)
+        # Run the same shell-ancestry functionality from the immutable baseline.
+        before_path, before_env = self.fixture(polls=7, workspaces=20)
+        for name in ("herdr-ports", "ports_processes.py"):
+            (before_path / name).write_bytes(subprocess.check_output(
+                ["git", "show", "fc912b3:" + name], cwd=ROOT))
+        before = self.run_watch(before_path, before_env, before_path / "herdr-ports")
+        self.assertEqual(len(before) + 1, 208)
+        self.assertEqual(sum(n == "herdr" and a[:1] == ["api"] for _, n, a in before), 7)
+        self.assertEqual(sum(n == "herdr" and a[:1] == ["pane"] for _, n, a in before), 60)
+        self.assertEqual(self.reports(before), self.reports(calls))
+        print("\n7 polls / 20 panes: external exec 208 -> 141; API reads 67 -> 27 (socket RPC).")
 
     def test_idle_polls_do_not_read_herdr_or_processes(self):
         path, env = self.fixture(polls=4, listeners=[[0, False], [3, True]])
         calls = self.run_watch(path, env)
-        self.assertTrue(all(t == 3 for t, n, _ in calls if n in ("herdr", "ps")))
+        self.assertTrue(all(t == 3 for t, n, _ in calls if n in ("herdr", "ps", "rpc")))
         self.assertEqual(sum(n == "python3" for _, n, _ in calls), 4)
 
     def test_snapshot_failures_preserve_leases_and_retry(self):
-        for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response", "info_fail", "ps_fail"):
+        for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response", "ps_fail"):
             path, env = self.fixture(polls=5, **{failure: [3]})
             calls = self.run_watch(path, env)
             self.assertEqual(self.reports(calls, True), [])
             self.assertEqual([t for t, _ in self.reports(calls)][-2:], [4, 4])
+
+    def test_process_info_failure_retries_next_poll(self):
+        path, env = self.fixture(polls=4, info_fail=[0])
+        calls = self.run_watch(path, env)
+        self.assertEqual([t for t, _ in self.reports(calls)], [1, 1, 3, 3])
+        self.assertEqual(self.reports(calls, True), [])
+        self.assertEqual([t for t, n, a in calls if n == "rpc" and a == ["pane.process_info"]], [0, 1, 1])
 
     def test_socket_failure_does_not_clear(self):
         path, env = self.fixture(polls=3, scan_fail=[1], listeners=[[2, False]])
@@ -199,7 +253,7 @@ class WatchTests(unittest.TestCase):
         path, env = self.fixture(polls=3, panes=[[1, []]])
         calls = self.run_watch(path, env)
         self.assertEqual([t for t, _ in self.reports(calls, True)], [1, 1])
-        self.assertEqual(sum(n == "herdr" and a[:1] == ["pane"] for _, n, a in calls), 2)
+        self.assertEqual(sum(n == "rpc" and a == ["pane.process_info"] for _, n, a in calls), 2)
 
     def test_cwd_is_display_only_and_commands_preserved(self):
         path, env = self.fixture(polls=3, cwd_fail=[0, 1, 2])

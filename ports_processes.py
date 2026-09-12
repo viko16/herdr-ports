@@ -3,12 +3,15 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import socket
 import struct
 import subprocess
 import sys
 
 
-SHELL_CACHE_SECONDS = 15
+# Snapshot membership/terminal IDs and kernel birth/parent IDs are checked on
+# every scan. This is only a fallback revalidation of the Herdr association.
+SHELL_CACHE_SECONDS = 300
 
 
 def command(*args):
@@ -16,8 +19,23 @@ def command(*args):
 
 
 def api(*args):
-    data = json.loads(command(os.environ.get("HERDR_BIN_PATH", "herdr"), *args))
-    if not isinstance(data, dict) or "error" in data or not isinstance(data.get("result"), dict):
+    if args == ("api", "snapshot"):
+        method, params = "session.snapshot", {}
+    elif len(args) == 4 and args[:3] == ("pane", "process-info", "--pane"):
+        method, params = "pane.process_info", {"pane_id": args[3]}
+    else:
+        raise ValueError("unsupported read method")
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    path = os.environ.get("HERDR_SOCKET_PATH") or str(config / "herdr/herdr.sock")
+    # Herdr 0.9.0 schema: newline-delimited Request/Response, protocol 22.
+    # One connection per request keeps failures local; no persistent client.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(3)
+        connection.connect(path)
+        connection.sendall(json.dumps(dict(id="ports", method=method, params=params)).encode() + b"\n")
+        with connection.makefile("rb") as response:
+            data = json.loads(response.readline())
+    if not isinstance(data, dict) or data.get("id") != "ports" or "error" in data or not isinstance(data.get("result"), dict):
         raise ValueError("invalid Herdr response")
     return data["result"]
 

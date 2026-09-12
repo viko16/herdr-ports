@@ -92,8 +92,8 @@ metadata tokens. The watcher is a singleton started automatically by a
 `pane.created` event hook - no daemon setup needed.
 
 For each nonempty listener scan, the resolver reads one batch process table and
-one fresh snapshot. Herdr 0.9.0 requires one `pane process-info` call per pane
-to obtain its shell PID; successful mappings are cached for at most 15 seconds.
+one fresh snapshot. New panes and changed terminal IDs require a shell PID lookup;
+stable mappings are revalidated through Herdr only every five minutes as a fallback.
 The cache is private to that watcher and bounded by the current pane inventory.
 Every scan checks the terminal ID and kernel process birth/parent identity
 (macOS microsecond birth time; Linux start ticks). A closed pane is removed on
@@ -101,6 +101,14 @@ the next snapshot even if its shell is still alive. A changed terminal ID forces
 a fresh lookup. A reused PID or changed shell PID cannot rebind the same terminal;
 it stays unknown until a new terminal identity is observed. There is no cached
 cwd or environment, and no per-PID external command.
+
+The two read methods (`session.snapshot` and `pane.process_info`, Herdr 0.9.0
+protocol 22) use newline-delimited JSON directly over the Unix socket, avoiding
+CLI launches. The socket path matches the watcher's singleton key below. Each
+request has its own connection and a three-second timeout; invalid/error responses
+and connection failures follow the same failure/retry rules, with no fallback to
+a different session. Metadata writes still use the Herdr CLI. A failed fallback
+lookup does not extend the cache lifetime and is retried on the next scan.
 
 Only processes on listener ancestry chains have their environments read, directly
 through macOS sysctl/libproc or Linux procfs. Birth/parent identities are rechecked
@@ -141,15 +149,18 @@ services, reparenting, plugin descendants and inherited context, ordinary Sideba
 labels, cleared environments, broken trees, PID reuse, terminal replacement,
 immediate closure, cache refresh, empty scans, failures, singleton locking and TTL.
 
-The fixed workload is seven polls with four stable active panes/Spaces. Its exact
-budget is **96 external commands**, including seven Python helper launches,
-seven socket dumps, seven `ps` calls, seven snapshots, twelve process-info calls
-(three refreshes per pane), sixteen metadata writes, lock startup and the absolute
-Bash exec. Snapshot/process-info costs are included, not hidden by mocking.
+The fixed workload is seven polls with twenty stable active panes/Spaces. Its exact
+budget is **141 external commands**, including seven Python helper launches,
+seven socket dumps, seven `ps` calls, eighty metadata writes, lock startup and the
+absolute Bash exec. Separately, it makes **27 socket RPCs**: seven snapshots and
+twenty initial shell lookups; the 15s and 30s boundaries trigger no extra lookups.
+The same fixture runs commit `fc912b3` for comparison: 208 external commands,
+including 67 read-API CLI launches (seven snapshots and sixty shell lookups).
 The watcher does not read cwds. The count excludes shell builtins, subshells,
 in-process kernel/file reads and the test harness; it is not a CPU/time benchmark.
-More panes add one process-info call each per refresh. The popup also makes one
+More panes add one shell RPC each on discovery and five-minute fallback. The popup also makes one
 batch cwd read on macOS and uses the same resolver without retaining shell mappings.
+Socket tests bind private temporary Unix sockets and need local socket permission.
 
 ## CLI
 
