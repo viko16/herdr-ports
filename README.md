@@ -30,7 +30,7 @@ of ordinary-terminal ownership. No program names or ports are blacklisted.
 ## Install
 
 ```sh
-herdr plugin install Numbered-com/herdr-ports
+herdr plugin install viko16/herdr-ports
 ```
 
 Requirements: Herdr 0.9.0+, **Python 3.8+** on `PATH` (standard library only),
