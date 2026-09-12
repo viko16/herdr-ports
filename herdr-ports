@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# herdr-ports - surface active dev servers in herdr.
+# herdr-ports - surface listening services started by each Herdr Space.
 #
-#   herdr-ports               interactive popup: checkbox list of servers, kill them
+#   herdr-ports               interactive popup: checkbox list of listeners
 #   herdr-ports list          print the table once and exit (scripting/debug)
 #   herdr-ports watch         poller: tag Spaces running >=1 TCP listener with a
 #                             generic $ports badge (workspace metadata, TTL-cleared)
@@ -19,10 +19,8 @@
 #   type = "plugin_action"
 #   command = "numbered.ports.open"
 #
-# Ports are attributed to a Space by matching the listener's process cwd
-# against the cwds of the workspace's panes, so servers started outside herdr
-# still show up as long as they run inside a workspace directory.
-# Requires jq; lists sockets with netstat (macOS sysctl dump), ss (Linux
+# Ports belong to a Space only through a live terminal shell ancestry chain.
+# Cwd is display-only. Requires Python 3; lists sockets with netstat (macOS sysctl dump), ss (Linux
 # netlink) or lsof as universal fallback - lsof also resolves cwds on macOS.
 # Written for bash 3.2 (stock macOS): no mapfile, no associative arrays; and
 # since read -t only takes whole seconds there, escape-sequence tails are read
@@ -35,7 +33,7 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 # Private Use Area characters from metadata tokens.
 BADGE="${HERDR_PORTS_BADGE:-↯}"
 INTERVAL="${HERDR_PORTS_INTERVAL-5}"
-WORKSPACE_INTERVAL="${HERDR_PORTS_WORKSPACE_INTERVAL-15}"
+PROCESS_HELPER="${BASH_SOURCE[0]%/*}/ports_processes.py"
 # 256-color index for the primary CTA chip, mimicking herdr's native accent
 # buttons (223 ~ vesper's peach). Panes render with the terminal palette, not
 # herdr's theme, so the exact accent cannot be queried - override to match.
@@ -86,9 +84,8 @@ pid_ports() (
 	fi
 )
 
-# stdin: "pid<TAB>..." lines -> "pid<TAB>cwd". Roots ("/") are dropped: system
-# daemons live there and would otherwise match every workspace.
-pid_cwds() (
+# Display only: stdin "pid<TAB>..." -> "pid<TAB>cwd".
+raw_pid_cwds() (
 	set -o pipefail
 	local pids pid cwd
 	pids=$(cut -f1 | sort -un)
@@ -96,7 +93,6 @@ pid_cwds() (
 	if [ -d /proc ]; then
 		for pid in $pids; do
 			cwd=$(readlink "/proc/$pid/cwd" 2> /dev/null) || continue
-			[ "$cwd" = "/" ] && continue
 			printf '%s\t%s\n' "$pid" "$cwd"
 		done
 	else
@@ -104,76 +100,29 @@ pid_cwds() (
 		output=$(lsof -a -d cwd -p "$(printf '%s\n' $pids | paste -s -d, -)" -Fpn 2> /dev/null) || status=$?
 		[ "$status" -le 1 ] || return "$status"
 		# A disappearing/inaccessible PID makes batch lsof exit 1 even when
-		# other PIDs have valid cwds. Keep those records, but reject a failed
-		# read with no complete records so it cannot clear every badge.
+		# other PIDs have valid cwds. Keep complete display records.
 		printf '%s\n' "$output" | awk -v status="$status" '
 			/^p/ { pid = substr($0, 2) }
-			/^n/ { cwd = substr($0, 2); if (pid ~ /^[0-9]+$/ && cwd != "") { seen = 1; if (cwd != "/") print pid "\t" cwd } }
+			/^n/ { cwd = substr($0, 2); if (pid ~ /^[0-9]+$/ && cwd != "") { seen = 1; print pid "\t" cwd } }
 			END { if (status && !seen) exit 1 }
 		'
 	fi
 )
 
-# "workspace_id<TAB>cwd" for every pane; failed reads return nonzero.
-workspace_cwds() (
+# Both the watcher and popup use the same shell ancestry resolver.
+active_workspaces() (
 	set -o pipefail
-	"$HERDR" api snapshot 2> /dev/null | jq -sr '
-		if length != 1 then error("missing snapshot") else .[0] end
-		| if type != "object" and type != "array" then error("invalid snapshot") else . end
-		| if type == "object" and (.error? != null or .ok? == false) then error("snapshot failed") else . end
-		|
-		.. | objects | select(has("pane_id") and has("workspace_id"))
-		| .workspace_id as $w
-		| ([.cwd?, .foreground_cwd?] | unique | .[])
-		| select(type == "string" and . != "" and . != "/")
-		| "\($w)\t\(.)"
-	' 2> /dev/null | sort -u
+	pid_ports | python3 "$PROCESS_HELPER" active "${1:--}" "${2:-$(date +%s)}"
 )
 
-# "workspace_id<TAB>label"
-workspace_labels() {
-	"$HERDR" workspace list 2> /dev/null | jq -r '
-		.result.workspaces[]? | [.workspace_id, (.label // .workspace_id)] | @tsv
-	' 2> /dev/null
-}
-
-# $1: workspace_cwds file; stdin: "pid<TAB>cwd" -> "pid<TAB>cwd<TAB>ws_id".
-# A listener belongs to a Space when its cwd sits under a pane cwd or vice
-# versa (server launched at the repo root while panes sit in subdirs). $HOME
-# is excluded from the reverse match: launchd/user daemons living there would
-# claim every workspace under it.
-match_join() {
-	awk -F'\t' -v home="$HOME" '
-		FILENAME == ARGV[1] { if (NF >= 2) { n++; wsid[n] = $1; wcwd[n] = $2 }; next }
-		{
-			for (i = 1; i <= n; i++) {
-				w = wcwd[i]
-				if ($2 == w || index($2, w "/") == 1 || ($2 != home && index(w, $2 "/") == 1)) {
-					print $1 "\t" $2 "\t" wsid[i]
-				}
-			}
-		}
-	' "$1" - | sort -u
-}
-
-# workspace_ids (one per line, sorted -u) running >=1 attributed TCP listener.
-# Shared by the watcher (post the badge) and the kill path (diff before/after
-# to clear the badge for Spaces that just lost their last server).
-active_workspaces() {
-	pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u
-}
-
 validate_watch_options() {
-	local value
-	for value in "$INTERVAL" "$WORKSPACE_INTERVAL"; do
-		case "$value" in
-			'' | 0* | *[!0-9]*) echo 'poll intervals must be integers from 1 to 3600 seconds' >&2; return 2 ;;
-		esac
-		[ "${#value}" -le 4 ] && [ "$value" -le 3600 ] || {
-			echo 'poll intervals must be integers from 1 to 3600 seconds' >&2
-			return 2
-		}
-	done
+	case "$INTERVAL" in
+		'' | 0* | *[!0-9]*) echo 'poll interval must be an integer from 1 to 3600 seconds' >&2; return 2 ;;
+	esac
+	[ "${#INTERVAL}" -le 4 ] && [ "$INTERVAL" -le 3600 ] || {
+		echo 'poll interval must be an integer from 1 to 3600 seconds' >&2
+		return 2
+	}
 }
 
 watch_singleton() {
@@ -213,26 +162,13 @@ watch_loop() {
 	# counter restarting at 1 would never show again.
 	validate_watch_options || return $?
 	local renew=$((INTERVAL * 2)) ttl=$(((INTERVAL * 3 + 10) * 1000))
-	local ws now cur rows='' refreshed=0 fetched leases='' next last known stamp readable
+	local ws now cur leases='' next last known stamp cache_dir
+	cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-watch.XXXXXX") || return 1
 	trap 'exit 0' TERM INT HUP
 	while :; do
 		now=$(date +%s)
-		readable=1
-		if [ "$refreshed" -eq 0 ] || [ "$now" -lt "$refreshed" ] || [ "$((now - refreshed))" -ge "$WORKSPACE_INTERVAL" ]; then
-			if fetched=$(workspace_cwds); then
-				rows=$fetched
-				refreshed=$now
-			else
-				# A failed read is not an empty snapshot. Keep lease state and
-				# retry next poll; TTL remains the backstop during an outage.
-				readable=0
-				refreshed=0
-			fi
-		fi
-		if ! cur=$(set -o pipefail; pid_ports | pid_cwds | match_join <(printf '%s\n' "$rows") | cut -f3 | sort -u); then
-			readable=0
-		fi
-		if [ "$readable" -eq 0 ]; then
+		if ! cur=$(active_workspaces "$cache_dir/shells.json" "$now"); then
+			# Failed reads preserve leases; retry next poll, TTL is the backstop.
 			sleep "$INTERVAL" || return 1
 			continue
 		fi
@@ -277,34 +213,11 @@ ensure_watch() {
 # "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>cmd" sorted by space then first port;
 # space is "-" for listeners outside any herdr workspace (sorted last)
 build_rows() {
-	local tmp="$1" space pid ports cwd cmd
-	pid_ports > "$tmp/ports"
-	pid_cwds < "$tmp/ports" > "$tmp/cwds"
-	workspace_cwds > "$tmp/ws"
-	workspace_labels > "$tmp/labels"
-	match_join "$tmp/ws" < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
-	awk -F'\t' '
-		FILENAME == ARGV[1] { lbl[$1] = $2; next }
-		FILENAME == ARGV[2] { if (!($1 in ws)) ws[$1] = ($2 in lbl ? lbl[$2] : $2); next }
-		FILENAME == ARGV[3] { ports[$1] = ports[$1] (ports[$1] == "" ? "" : " ") ":" $2; if (!($1 in first)) first[$1] = $2; next }
-		{ cwd[$1] = $2 }
-		END {
-			for (p in ports) {
-				space = (p in ws ? ws[p] : "-")
-				# "~" sort sentinel pushes unmatched listeners after real spaces
-				printf "%s\t%05d\t%s\t%s\t%s\t%s\n", (space == "-" ? "~" : space), first[p], space, p, ports[p], (p in cwd ? cwd[p] : "-")
-			}
-		}
-	' "$tmp/labels" "$tmp/pidws" "$tmp/ports" "$tmp/cwds" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 | cut -f3- \
-		| while IFS=$'\t' read -r space pid ports cwd; do
-			cmd=$(ps -o args= -p "$pid" 2> /dev/null | head -1)
-			# tabs would shift the TSV fields read back by the consumers, and
-			# bash substring truncation is character-based, unlike cut -c
-			# which can slice a multibyte UTF-8 char in half
-			cmd=${cmd//$'\t'/ }
-			cmd=${cmd:0:60}
-			printf '%s\t%s\t%s\t%s\t%s\n' "$space" "$pid" "$ports" "$cwd" "${cmd:-?}"
-		done
+	local tmp="$1"
+	pid_ports > "$tmp/ports" || return 1
+	# Cwd failure affects display only, never ownership.
+	raw_pid_cwds < "$tmp/ports" > "$tmp/cwds" || true
+	python3 "$PROCESS_HELPER" rows - "$(date +%s)" "$tmp/cwds" < "$tmp/ports"
 }
 
 shorten() {
@@ -318,7 +231,7 @@ list_mode() {
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"' EXIT
 	local space pid ports cwd cmd
-	build_rows "$tmp" > "$tmp/rows"
+	build_rows "$tmp" > "$tmp/rows" || return 1
 	printf '%-12s %-20s %-7s %-30s %s\n' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
 	while IFS=$'\t' read -r space pid ports cwd cmd; do
 		printf '%-12.12s %-20s %-7s %-30s %s\n' "$space" "$ports" "$pid" "$(shorten "$cwd")" "$cmd"
@@ -338,7 +251,7 @@ cursor_down() {
 }
 
 # TERM the checked rows (or the highlighted one when none checked). Instead of
-# the old blocking 2s wait, poll fast (dev servers exit on TERM in a few ms) so
+# a blocking 2s wait, poll fast for services that exit promptly on TERM so
 # the popup redraws immediately, escalate any straggler to KILL in a detached
 # child, and clear the sidebar badge for Spaces that just lost their last
 # listener rather than waiting out the metadata TTL. Outcome -> $status (footer).
@@ -349,7 +262,7 @@ kill_targets() {
 	done
 	[ -z "$targets" ] && [ "$n" -gt 0 ] && targets="${pids[cur]}"
 	[ -n "$targets" ] || return 0
-	before=$(active_workspaces)
+	before=$(active_workspaces) || { status='Unable to read services'; return 1; }
 	for pid in $targets; do
 		kill "$pid" 2> /dev/null && killed="$killed $pid"
 	done
@@ -371,7 +284,7 @@ kill_targets() {
 	# clear the $ports badge for Spaces whose last listener just died; seq must
 	# exceed the watcher's last post (epoch seconds - our "now" wins unless the
 	# watcher posted this exact second, in which case the TTL is the backstop)
-	after=$(active_workspaces)
+	after=$(active_workspaces) || { status='Unable to refresh services'; needs_refresh=1; return 1; }
 	for ws in $(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after")); do
 		[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
 			--source ports --clear-token ports --seq "$(date +%s)" > /dev/null 2>&1
@@ -423,7 +336,7 @@ popup() {
 
 	while :; do
 		if [ "$needs_refresh" = 1 ]; then
-			build_rows "$tmp" > "$tmp/rows"
+			build_rows "$tmp" > "$tmp/rows" || return 1
 			if [ "$show_all" = 1 ]; then
 				cp "$tmp/rows" "$tmp/view"
 			else
@@ -474,7 +387,7 @@ popup() {
 		frame=$'\033[H'
 		suffix=''
 		[ "$show_all" = 1 ] && suffix=' (all listeners)'
-		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n\033[K\n'
+		frame+=$'\033[1m'"Listening services$suffix"$'\033[0m\033[K\n\033[K\n'
 		if [ "$n" = 0 ]; then
 			frame+='  (none - "a" includes listeners outside herdr workspaces)'$'\033[K\n'
 		else

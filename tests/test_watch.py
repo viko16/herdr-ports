@@ -12,10 +12,6 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "herdr-ports"
-BASELINE = "bada711cac11c2243600019446c8a68216415569"
-
-# These executables only read/write a private temporary fixture. Time advances
-# at sleep boundaries, so TTL assertions do not depend on wall-clock timing.
 MOCK = r'''#!/usr/bin/python3
 import json, os, pathlib, subprocess, sys, time
 p = pathlib.Path(os.environ["FIXTURE"])
@@ -30,13 +26,44 @@ def value(key, default):
         if tick >= start:
             result = item
     return result
-if name == "uname":
+def table():
+    rows = []
+    for i in range(cfg.get("workspaces", 2)):
+        rows.extend([f"{10000+i} 1 zsh", f"{20000+i} {10000+i} tnpm run serve",
+                     f"{424242+i} {20000+i} node /shared/server.js"])
+    return value("processes", "\n".join(rows))
+def sockets():
+    return cfg.get("sockets", [[424242+i, 3000+i] for i in range(cfg.get("workspaces", 2))])
+if name == "python3":
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ports_processes", sys.argv[1])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    class Kernel:
+        def identity(self, pid):
+            rows = {int(line.split()[0]): int(line.split()[1]) for line in table().splitlines()}
+            if pid not in rows:
+                raise OSError("missing")
+            return tuple(value("identities", {}).get(str(pid), [rows[pid], pid, 0]))
+        def environ(self, pid):
+            env = value("environments", {}).get(str(pid), {"HERDR_ENV": "1"})
+            if env is None:
+                raise OSError("denied")
+            return {k.encode(): v.encode() for k, v in env.items()}
+    module.KernelProcesses = Kernel
+    sys.argv = sys.argv[1:]
+    try:
+        module.main()
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        sys.exit(1)
+elif name == "uname":
     print(cfg.get("platform", "Darwin"))
 elif name == "netstat":
     if tick in cfg.get("scan_fail", []):
         sys.exit(1)
     if value("listeners", True):
-        print("tcp4 0 0 127.0.0.1.3000 *.* LISTEN app:424242")
+        for pid, port in sockets():
+            print(f"tcp4 0 0 127.0.0.1.{port} *.* LISTEN app:{pid}")
 elif name == "lsof":
     if "-iTCP" in sys.argv:
         if tick in cfg.get("scan_fail", []):
@@ -44,16 +71,22 @@ elif name == "lsof":
             sys.exit(1)
         if not value("listeners", True):
             sys.exit(1)
-        print("p424242\nn127.0.0.1:3000")
+        for pid, port in sockets():
+            print(f"p{pid}\nn127.0.0.1:{port}")
         sys.exit(1 if cfg.get("scan_partial") else 0)
     if tick in cfg.get("cwd_fail", []):
         sys.exit(1)
-    print("p424242\nn" + value("pid_cwd", "/project"))
+    for pid, cwd in cfg.get("cwds", [[pid, value("pid_cwd", "/shared")] for pid, _ in sockets()]):
+        print(f"p{pid}\nn{cwd}")
     if tick in cfg.get("cwd_partial", []):
         print("p424243")  # another PID exited before its cwd was read
         sys.exit(1)
 elif name == "date":
     print(1000 + tick * 5)
+elif name == "ps":
+    if tick in cfg.get("ps_fail", []):
+        sys.exit(1)
+    print(table())
 elif name == "sleep":
     time.sleep(cfg.get("delay", 0))
     (p / "tick").write_text(str(tick + 1))
@@ -71,9 +104,17 @@ elif name == "herdr":
         if tick in cfg.get("snapshot_invalid", []):
             print("not json")
         else:
-            print(json.dumps([{"pane_id": "p" + str(i), "workspace_id": "w" + str(i),
-                "cwd": value("workspace_cwd", "/project")}
-                for i in range(cfg.get("workspaces", 2))]))
+            panes = value("panes", [{"pane_id": "p" + str(i), "workspace_id": "w" + str(i),
+                "terminal_id": "t" + str(i), "cwd": "/shared", "label": "Sidebar"}
+                for i in range(cfg.get("workspaces", 2))])
+            print(json.dumps({"result": {"snapshot": {"panes": panes, "workspaces":
+                [{"workspace_id": "w"+str(i), "label": "space"+str(i)} for i in range(cfg.get("workspaces", 2))]}}}))
+    elif sys.argv[1:3] == ["pane", "process-info"]:
+        if tick in cfg.get("info_fail", []):
+            sys.exit(1)
+        pane = sys.argv[-1]
+        pid = value("shells", {}).get(pane, 10000 + int(pane[1:]))
+        print(json.dumps({"result": {"process_info": {"pane_id": pane, "shell_pid": pid}}}))
     else:
         clear = "--clear-token" in sys.argv
         sys.exit(1 if tick in cfg.get("clear_fail" if clear else "post_fail", []) else 0)
@@ -86,19 +127,19 @@ class WatchTests(unittest.TestCase):
     def fixture(self, **config):
         # Leave temporary fixtures to the OS; never delete via rm/rmtree.
         path = Path(tempfile.mkdtemp(prefix="herdr-ports-test-"))
-        commands = ("awk", "sort", "cut", "jq", "comm", "id", "cat", "dirname", "basename", "perl", "paste", "readlink")
+        commands = ("awk", "sort", "cut", "comm", "id", "cat", "dirname", "basename", "perl", "paste", "readlink", "mktemp")
         config["real_commands"] = {name: shutil.which(name) for name in commands}
         (path / "config").write_text(json.dumps(config))
         (path / "tick").write_text("0")
         (path / "calls").touch()
         (path / "mock").write_text(MOCK)
         (path / "mock").chmod(0o755)
-        for command in ("uname", "netstat", "lsof", "date", "sleep", "herdr") + commands:
+        for command in ("uname", "netstat", "lsof", "ps", "python3", "date", "sleep", "herdr") + commands:
             (path / command).symlink_to("mock")
         env = dict(os.environ, PATH=str(path) + ":" + os.environ["PATH"],
                    FIXTURE=str(path), HERDR_BIN_PATH=str(path / "herdr"),
                    HERDR_SOCKET_PATH=str(path / "session.sock"),
-                   HERDR_PORTS_INTERVAL="5", HERDR_PORTS_WORKSPACE_INTERVAL="15")
+                   HERDR_PORTS_INTERVAL="5")
         return path, env
 
     def run_watch(self, path, env):
@@ -118,42 +159,65 @@ class WatchTests(unittest.TestCase):
                 and args[:2] == ["workspace", "report-metadata"]
                 and (("--clear-token" in args) == clear)]
 
-    def test_renewal_and_call_counts_against_baseline(self):
+
+    def test_complete_stable_polling_budget(self):
         path, env = self.fixture(polls=7, workspaces=4)
         calls = self.run_watch(path, env)
+        counts = collections.Counter(
+            "snapshot" if name == "herdr" and args[:1] == ["api"] else
+            "process-info" if name == "herdr" and args[:1] == ["pane"] else
+            "metadata" if name == "herdr" else name for _, name, args in calls)
+        self.assertEqual({key: counts[key] for key in ("python3", "ps", "netstat", "lsof", "snapshot", "process-info", "metadata")},
+                         dict(python3=7, ps=7, netstat=7, lsof=0, snapshot=7, **{"process-info": 12}, metadata=16))
         self.assertEqual([t for t, a in self.reports(calls)][::4], [0, 2, 4, 6])
         for _, args in self.reports(calls):
             self.assertEqual(args[args.index("--ttl-ms") + 1], "25000")
-        baseline = subprocess.check_output(["git", "show", BASELINE + ":herdr-ports"],
-                                           cwd=ROOT, text=True)
-        # Export definitions only; intercept baseline cleanup and terminate its
-        # unbounded loop at the same mock sleep boundary as the new watcher.
-        old_path, old_env = self.fixture(polls=7, workspaces=4)
-        source = old_path / "baseline"
-        source.write_text(baseline.rsplit('case "${1:-}" in', 1)[0])
-        harness = '''source "$1"
-watcher_alive() { return 1; }
-pidfile_path() { printf '%s/pid' "$FIXTURE"; }
-rm() { :; }
-sleep() { command sleep "$@" || exit 0; }
-watch_loop
-'''
-        subprocess.run(["/bin/bash", "-c", harness, "test", str(source)],
-                       env=old_env, check=True, timeout=15, capture_output=True)
-        def counts(items):
-            return dict(collections.Counter("snapshot" if name == "herdr" and args[:1] == ["api"]
-                       else "metadata" if name == "herdr" else name
-                       for _, name, args in items if name in ("netstat", "lsof", "herdr")))
-        before, after = counts(self.calls(old_path)), counts(calls)
-        self.assertEqual(before, dict(netstat=7, lsof=7, snapshot=7, metadata=28))
-        self.assertEqual(after, dict(netstat=7, lsof=7, snapshot=3, metadata=16))
-        print("\nFixed 7 polls / 4 workspaces:", before, "->", after)
-        # Perl execs /bin/bash by absolute path once; account for that launch
-        # explicitly in addition to every intercepted PATH command.
-        before_total, after_total = len(self.calls(old_path)), len(calls) + 1
-        print("All external commands (including lock startup and Bash exec):",
-              before_total, "->", after_total)
-        self.assertLess(after_total, before_total)
+        # Include the singleton launcher's absolute Bash exec, not only PATH.
+        self.assertEqual(len(calls) + 1, 96)
+        print("\nComplete 7 polls / 4 panes budget:", dict(counts), "total:", len(calls) + 1,
+              "(previous measured implementation: 148)")
+
+    def test_idle_polls_do_not_read_herdr_or_processes(self):
+        path, env = self.fixture(polls=4, listeners=[[0, False], [3, True]])
+        calls = self.run_watch(path, env)
+        self.assertTrue(all(t == 3 for t, n, _ in calls if n in ("herdr", "ps")))
+        self.assertEqual(sum(n == "python3" for _, n, _ in calls), 4)
+
+    def test_snapshot_failures_preserve_leases_and_retry(self):
+        for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response", "info_fail", "ps_fail"):
+            path, env = self.fixture(polls=5, **{failure: [3]})
+            calls = self.run_watch(path, env)
+            self.assertEqual(self.reports(calls, True), [])
+            self.assertEqual([t for t, _ in self.reports(calls)][-2:], [4, 4])
+
+    def test_socket_failure_does_not_clear(self):
+        path, env = self.fixture(polls=3, scan_fail=[1], listeners=[[2, False]])
+        calls = self.run_watch(path, env)
+        self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
+
+    def test_closed_panes_clear_immediately_not_after_cache_ttl(self):
+        path, env = self.fixture(polls=3, panes=[[1, []]])
+        calls = self.run_watch(path, env)
+        self.assertEqual([t for t, _ in self.reports(calls, True)], [1, 1])
+        self.assertEqual(sum(n == "herdr" and a[:1] == ["pane"] for _, n, a in calls), 2)
+
+    def test_cwd_is_display_only_and_commands_preserved(self):
+        path, env = self.fixture(polls=3, cwd_fail=[0, 1, 2])
+        self.assertEqual(len(self.reports(self.run_watch(path, env))), 4)
+        result = subprocess.run(["/bin/bash", "-c", 'source "$1"; build_rows "$FIXTURE"', "test", str(SCRIPT)],
+                                env=env, capture_output=True, text=True, check=True)
+        self.assertIn("node /shared/server.js", result.stdout)
+
+    def test_lsof_partial_and_failure(self):
+        for partial in ([], [0]):
+            path, env = self.fixture(cwd_partial=partial)
+            result = subprocess.run(["/bin/bash", "-c", 'source "$1"; printf "424242\\t3000\\n" | raw_pid_cwds',
+                                     "test", str(SCRIPT)], env=env, capture_output=True, text=True, check=True)
+            self.assertIn("424242\t/shared", result.stdout)
+        path, env = self.fixture(polls=4, platform="Other", scan_partial=True,
+                                 scan_fail=[1], listeners=[[2, False]])
+        calls = self.run_watch(path, env)
+        self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
 
     def test_changes_clear_immediately_and_retry(self):
         path, env = self.fixture(polls=5, listeners=[[1, False], [3, True]],
@@ -166,68 +230,6 @@ watch_loop
         path, env = self.fixture(polls=5, post_fail=[0, 3])
         calls = self.run_watch(path, env)
         self.assertEqual([t for t, _ in self.reports(calls)][::2], [0, 1, 3, 4])
-
-    def test_workspace_cache_expires_for_pane_cd(self):
-        path, env = self.fixture(polls=5, workspace_cwd=[[1, "/other"]])
-        calls = self.run_watch(path, env)
-        self.assertEqual([t for t, n, a in calls if n == "herdr" and a[:1] == ["api"]], [0, 3])
-        self.assertEqual([t for t, _ in self.reports(calls, True)], [3, 3])
-
-    def test_pid_cwd_is_never_cached(self):
-        path, env = self.fixture(polls=3, pid_cwd=[[1, "/other"], [2, "/project"]])
-        calls = self.run_watch(path, env)
-        self.assertEqual([t for t, _ in self.reports(calls, True)], [1, 1])
-        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0, 2, 2])
-
-    def test_snapshot_failure_preserves_badges_and_retries(self):
-        for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response"):
-            path, env = self.fixture(polls=5, **{failure: [3]})
-            calls = self.run_watch(path, env)
-            self.assertEqual(self.reports(calls, True), [])
-            self.assertEqual([t for t, n, a in calls if n == "herdr" and a[:1] == ["api"]], [0, 3, 4])
-            self.assertEqual([t for t, _ in self.reports(calls)][-2:], [4, 4])
-
-    def test_scan_and_cwd_failure_are_not_empty_sets(self):
-        for failure in ("scan_fail", "cwd_fail"):
-            path, env = self.fixture(polls=4, listeners=[[2, False]], **{failure: [1]})
-            calls = self.run_watch(path, env)
-            self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
-
-    def test_lsof_partial_success_keeps_attribution_and_renewal(self):
-        path, env = self.fixture(polls=5, cwd_partial=[0, 1, 2, 3, 4])
-        calls = self.run_watch(path, env)
-        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0, 2, 2, 4, 4])
-        self.assertEqual(self.reports(calls, True), [])
-
-    def test_lsof_fallback_partial_empty_and_failure(self):
-        path, env = self.fixture(polls=4, platform="Other", scan_partial=True,
-                                 scan_fail=[1], listeners=[[2, False]])
-        calls = self.run_watch(path, env)
-        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0])
-        self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
-
-    def test_attribution_rules_and_empty_workspace_file(self):
-        path, env = self.fixture()
-        workspace = path / "workspaces"
-        for rows, cwd, expected in (
-            ("w\t/project/src\n", "/project", "w"),
-            ("w\t/project/src\n", "/project/src/sub", "w"),
-            ("w\t/project/src\n", "/project/src", "w"),
-            ("w\t/project/src\n", "/project/src-other", ""),
-            ("w\t" + env["HOME"] + "/src\n", env["HOME"], ""),
-            ("", "/project", ""),
-        ):
-            workspace.write_text(rows)
-            result = subprocess.run(["/bin/bash", "-c", 'source "$1"; match_join "$2"',
-                                     "test", str(SCRIPT), str(workspace)],
-                                    env=env, input="424242\t" + cwd + "\n",
-                                    text=True, capture_output=True, check=True)
-            self.assertEqual(result.stdout.strip().split("\t")[-1], expected)
-
-    def test_successful_empty_snapshot_clears(self):
-        path, env = self.fixture(polls=4, workspace_cwd=[[3, "/"]])
-        calls = self.run_watch(path, env)
-        self.assertEqual([t for t, _ in self.reports(calls, True)], [3, 3])
 
     def test_inherited_lock_lasts_until_last_child_exits(self):
         path, env = self.fixture(polls=1, descendant=True)
@@ -274,7 +276,7 @@ watch_loop
         self.assertEqual(sum(n == "netstat" for _, n, _ in self.calls(path)), 2)
 
     def test_invalid_intervals_do_not_poll(self):
-        for key in ("HERDR_PORTS_INTERVAL", "HERDR_PORTS_WORKSPACE_INTERVAL"):
+        for key in ("HERDR_PORTS_INTERVAL",):
             for value in ("", "0", "-1", "0.5", "abc", "08", "999999999999999999999", "3601"):
                 path, env = self.fixture()
                 env[key] = value

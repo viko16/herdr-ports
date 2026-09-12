@@ -4,15 +4,15 @@
 id = "numbered.ports"
 name = "Ports"
 version = "0.1.2"
-description = "Active dev servers per Space: sidebar $ports badge + kill popup"
-min_herdr_version = "0.7.4"
+description = "Listening services started by each Space: sidebar $ports badge + kill popup"
+min_herdr_version = "0.9.0"
 platforms = ["linux", "macos"]
 
 # Popup listing listening servers grouped by Space; arrows + space to check,
 # enter kills (TERM, then KILL after 2s), esc quits
 [[panes]]
 id = "main"
-title = "ports"
+title = "Listening services"
 placement = "popup"
 width = "50%"
 height = "40%"
