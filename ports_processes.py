@@ -18,6 +18,24 @@ def command(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL)
 
 
+def rpc(method, params):
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    path = os.environ.get("HERDR_SOCKET_PATH") or str(config / "herdr/herdr.sock")
+    # Herdr 0.9.0 schema: newline-delimited Request/Response, protocol 22.
+    # Ordinary methods are one request per connection. Keeping failures local
+    # also lets metadata batches continue after one workspace write fails.
+    request = dict(id="ports", method=method, params=params)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(3)
+        connection.connect(path)
+        connection.sendall(json.dumps(request).encode() + b"\n")
+        with connection.makefile("rb") as response:
+            data = json.loads(response.readline())
+    if not isinstance(data, dict) or data.get("id") != "ports" or "error" in data or not isinstance(data.get("result"), dict):
+        raise ValueError("invalid Herdr response")
+    return data["result"]
+
+
 def api(*args):
     if args == ("api", "snapshot"):
         method, params = "session.snapshot", {}
@@ -25,19 +43,48 @@ def api(*args):
         method, params = "pane.process_info", {"pane_id": args[3]}
     else:
         raise ValueError("unsupported read method")
-    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    path = os.environ.get("HERDR_SOCKET_PATH") or str(config / "herdr/herdr.sock")
-    # Herdr 0.9.0 schema: newline-delimited Request/Response, protocol 22.
-    # One connection per request keeps failures local; no persistent client.
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(3)
-        connection.connect(path)
-        connection.sendall(json.dumps(dict(id="ports", method=method, params=params)).encode() + b"\n")
-        with connection.makefile("rb") as response:
-            data = json.loads(response.readline())
-    if not isinstance(data, dict) or data.get("id") != "ports" or "error" in data or not isinstance(data.get("result"), dict):
-        raise ValueError("invalid Herdr response")
-    return data["result"]
+    return rpc(method, params)
+
+
+def report_metadata(workspace_id, value, seq, ttl_ms=None):
+    params = {
+        "workspace_id": workspace_id,
+        "source": "ports",
+        "tokens": {"ports": value},
+        "seq": seq,
+    }
+    if ttl_ms is not None:
+        params["ttl_ms"] = ttl_ms
+    result = rpc("workspace.report_metadata", params)
+    if result.get("type") != "ok":
+        raise ValueError("invalid metadata response")
+
+
+def metadata_batch(lines, timestamp, ttl_raw, badge):
+    seq = int(timestamp)
+    ttl_ms = None if ttl_raw == "-" else int(ttl_raw)
+    if seq < 0 or (ttl_ms is not None and ttl_ms <= 0):
+        raise ValueError("invalid metadata timing")
+    for raw in lines:
+        raw = raw.rstrip("\n")
+        if not raw:
+            continue
+        operation, workspace_id = raw.split("\t", 1)
+        if not workspace_id:
+            raise ValueError("missing workspace id")
+        if operation == "set":
+            if ttl_ms is None:
+                raise ValueError("set operation requires ttl")
+            value, ttl = badge, ttl_ms
+        elif operation == "clear":
+            value, ttl = None, None
+        else:
+            raise ValueError("invalid metadata operation")
+        try:
+            report_metadata(workspace_id, value, seq, ttl)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        print(f"{operation} {workspace_id}")
 
 
 def process_table():
@@ -246,7 +293,17 @@ def display_rows(ports, assigned, table, snapshot, cwds):
 
 
 def main():
-    mode, cache_path, timestamp, *files = sys.argv[1:]
+    if len(sys.argv) < 2:
+        raise ValueError("missing mode")
+    mode = sys.argv[1]
+    if mode == "metadata":
+        if len(sys.argv) != 5:
+            raise ValueError("invalid metadata arguments")
+        metadata_batch(sys.stdin, sys.argv[2], sys.argv[3], sys.argv[4])
+        return
+    if len(sys.argv) < 4:
+        raise ValueError("invalid scan arguments")
+    _, cache_path, timestamp, *files = sys.argv[1:]
     cache = json.loads(Path(cache_path).read_text()) if cache_path != "-" and Path(cache_path).exists() else {}
     ports = {}
     for line in sys.stdin:
@@ -259,12 +316,14 @@ def main():
         pending.replace(cache_path)
     if mode == "active":
         print("\n".join(sorted(set(assigned.values()))))
-    else:
+    elif mode == "rows":
         cwds = {}
         for line in Path(files[0]).read_text().splitlines():
             pid, cwd = line.split("\t", 1)
             cwds[int(pid)] = cwd
         display_rows(ports, assigned, table, snapshot, cwds)
+    else:
+        raise ValueError("invalid mode")
 
 
 if __name__ == "__main__":

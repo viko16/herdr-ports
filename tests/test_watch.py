@@ -78,6 +78,16 @@ if name == "python3":
                 pane = request["params"]["pane_id"]
                 result = {"process_info": {"pane_id": pane, "shell_pid":
                     value("shells", {}).get(pane, 10000 + int(pane[1:]))}}
+            elif method == "workspace.report_metadata":
+                params = request["params"]
+                with (p / "calls").open("a") as f:
+                    f.write(json.dumps([tick, "metadata_rpc", params]) + "\n")
+                clear = params["tokens"].get("ports") is None
+                if tick in cfg.get("clear_fail" if clear else "post_fail", []):
+                    self.response = (json.dumps({"id": request["id"], "error":
+                        {"code": "failed", "message": "mock metadata failure"}}) + "\n").encode()
+                    return
+                result = {"type": "ok"}
             else:
                 raise AssertionError("unexpected write method")
             self.response = (json.dumps({"id": request["id"], "result": result}) + "\n").encode()
@@ -190,28 +200,44 @@ class WatchTests(unittest.TestCase):
 
     @staticmethod
     def reports(calls, clear=False):
-        return [(tick, args) for tick, name, args in calls if name == "herdr"
-                and args[:2] == ["workspace", "report-metadata"]
-                and (("--clear-token" in args) == clear)]
+        reports = []
+        for tick, name, args in calls:
+            if name == "metadata_rpc":
+                params = args
+            elif name == "herdr" and args[:2] == ["workspace", "report-metadata"]:
+                def flag(key):
+                    return args[args.index(key) + 1]
+                params = {
+                    "workspace_id": args[2],
+                    "source": flag("--source"),
+                    "tokens": {"ports": None if "--clear-token" in args else flag("--token").split("=", 1)[1]},
+                    "seq": int(flag("--seq")),
+                }
+                if "--ttl-ms" in args:
+                    params["ttl_ms"] = int(flag("--ttl-ms"))
+            else:
+                continue
+            if ((params["tokens"].get("ports") is None) == clear):
+                reports.append((tick, params))
+        return reports
 
 
     def test_complete_stable_polling_budget(self):
         path, env = self.fixture(polls=7, workspaces=20)
         calls = self.run_watch(path, env)
-        counts = collections.Counter(
-            "snapshot" if name == "herdr" and args[:1] == ["api"] else
-            "process-info" if name == "herdr" and args[:1] == ["pane"] else
-            "metadata" if name == "herdr" else name for _, name, args in calls)
-        self.assertEqual({key: counts[key] for key in ("python3", "ps", "netstat", "lsof", "snapshot", "process-info", "metadata")},
-                         dict(python3=7, ps=7, netstat=7, lsof=0, snapshot=0, **{"process-info": 0}, metadata=80))
+        counts = collections.Counter(name for _, name, _ in calls if name not in ("rpc", "metadata_rpc"))
+        self.assertEqual({key: counts[key] for key in ("python3", "ps", "netstat", "lsof", "herdr")},
+                         dict(python3=11, ps=7, netstat=7, lsof=0, herdr=0))
         self.assertEqual(collections.Counter(a[0] for _, n, a in calls if n == "rpc"),
-                         {"session.snapshot": 7, "pane.process_info": 20})
+                         {"session.snapshot": 7, "pane.process_info": 20, "workspace.report_metadata": 80})
         self.assertEqual([t for t, n, a in calls if n == "rpc" and a == ["pane.process_info"]], [0] * 20)
-        self.assertEqual([t for t, a in self.reports(calls)][::20], [0, 2, 4, 6])
-        for _, args in self.reports(calls):
-            self.assertEqual(args[args.index("--ttl-ms") + 1], "25000")
+        self.assertEqual([t for t, _ in self.reports(calls)][::20], [0, 2, 4, 6])
+        for _, params in self.reports(calls):
+            self.assertEqual(params["source"], "ports")
+            self.assertEqual(params["tokens"], {"ports": "↯"})
+            self.assertEqual(params["ttl_ms"], 25000)
         # Include the singleton launcher's absolute Bash exec, not only PATH.
-        self.assertEqual(sum(n != "rpc" for _, n, _ in calls) + 1, 141)
+        self.assertEqual(sum(n not in ("rpc", "metadata_rpc") for _, n, _ in calls) + 1, 65)
         # Run the same shell-ancestry functionality from the immutable baseline.
         before_path, before_env = self.fixture(polls=7, workspaces=20)
         for name in ("herdr-ports", "ports_processes.py"):
@@ -222,13 +248,13 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(sum(n == "herdr" and a[:1] == ["api"] for _, n, a in before), 7)
         self.assertEqual(sum(n == "herdr" and a[:1] == ["pane"] for _, n, a in before), 60)
         self.assertEqual(self.reports(before), self.reports(calls))
-        print("\n7 polls / 20 panes: external exec 208 -> 141; API reads 67 -> 27 (socket RPC).")
+        print("\n7 polls / 20 panes: external exec 208 -> 65; API reads 67 -> 27 plus 80 socket metadata writes.")
 
     def test_idle_polls_do_not_read_herdr_or_processes(self):
         path, env = self.fixture(polls=4, listeners=[[0, False], [3, True]])
         calls = self.run_watch(path, env)
         self.assertTrue(all(t == 3 for t, n, _ in calls if n in ("herdr", "ps", "rpc")))
-        self.assertEqual(sum(n == "python3" for _, n, _ in calls), 4)
+        self.assertEqual(sum(n == "python3" for _, n, _ in calls), 5)
 
     def test_snapshot_failures_preserve_leases_and_retry(self):
         for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response", "ps_fail"):

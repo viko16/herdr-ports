@@ -102,13 +102,17 @@ a fresh lookup. A reused PID or changed shell PID cannot rebind the same termina
 it stays unknown until a new terminal identity is observed. There is no cached
 cwd or environment, and no per-PID external command.
 
-The two read methods (`session.snapshot` and `pane.process_info`, Herdr 0.9.0
-protocol 22) use newline-delimited JSON directly over the Unix socket, avoiding
-CLI launches. The socket path matches the watcher's singleton key below. Each
-request has its own connection and a three-second timeout; invalid/error responses
-and connection failures follow the same failure/retry rules, with no fallback to
-a different session. Metadata writes still use the Herdr CLI. A failed fallback
-lookup does not extend the cache lifetime and is retried on the next scan.
+The read methods (`session.snapshot` and `pane.process_info`) and metadata writes
+(`workspace.report_metadata`, Herdr 0.9.0 protocol 22) use newline-delimited JSON
+directly over the session Unix socket, avoiding Herdr CLI launches. The socket
+path matches the watcher's singleton key below. Ordinary Herdr methods are one
+request per connection, so each request gets its own connection and three-second
+timeout. A polling cycle batches all pending metadata operations into one Python
+helper launch while preserving one socket request per workspace. Individual
+metadata failures do not abort the batch: successful leases advance, failed set
+or clear operations retry on the next poll. Invalid/error responses and connection
+failures never fall back to a different session. A failed shell fallback lookup
+does not extend the cache lifetime and is retried on the next scan.
 
 Only processes on listener ancestry chains have their environments read, directly
 through macOS sysctl/libproc or Linux procfs. Birth/parent identities are rechecked
@@ -150,17 +154,19 @@ labels, cleared environments, broken trees, PID reuse, terminal replacement,
 immediate closure, cache refresh, empty scans, failures, singleton locking and TTL.
 
 The fixed workload is seven polls with twenty stable active panes/Spaces. Its exact
-budget is **141 external commands**, including seven Python helper launches,
-seven socket dumps, seven `ps` calls, eighty metadata writes, lock startup and the
-absolute Bash exec. Separately, it makes **27 socket RPCs**: seven snapshots and
-twenty initial shell lookups; the 15s and 30s boundaries trigger no extra lookups.
-The same fixture runs commit `fc912b3` for comparison: 208 external commands,
-including 67 read-API CLI launches (seven snapshots and sixty shell lookups).
-The watcher does not read cwds. The count excludes shell builtins, subshells,
-in-process kernel/file reads and the test harness; it is not a CPU/time benchmark.
-More panes add one shell RPC each on discovery and five-minute fallback. The popup also makes one
-batch cwd read on macOS and uses the same resolver without retaining shell mappings.
-Socket tests bind private temporary Unix sockets and need local socket permission.
+budget is **65 external commands**, including eleven Python helper launches (seven
+listener/ownership scans plus four metadata batches), seven socket dumps, seven
+`ps` calls, lock startup and the absolute Bash exec. Separately, it makes **107
+socket RPCs**: seven snapshots, twenty initial shell lookups and eighty metadata
+writes; the 15s and 30s boundaries trigger no extra shell lookups. The same fixture
+runs commit `fc912b3` for comparison: 208 external commands, including 67 read-API
+CLI launches (seven snapshots and sixty shell lookups). The watcher does not read
+cwds. The count excludes shell builtins, subshells, in-process kernel/file reads and
+the test harness; it is not a CPU/time benchmark. More panes add one shell RPC each
+on discovery and five-minute fallback. Metadata renewal adds socket RPCs but no
+per-workspace executable launch. The popup also makes one batch cwd read on macOS
+and uses the same resolver without retaining shell mappings. Socket tests bind
+private temporary Unix sockets and need local socket permission.
 
 ## CLI
 
