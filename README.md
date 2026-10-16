@@ -5,7 +5,7 @@ a generic `$ports` badge (`↯`) and a popup to inspect and stop TCP listeners.
 
 A listener is assigned only when its live parent chain reaches a terminal
 `shell_pid` reported by Herdr for that Space. For example,
-`shell -> tnpm -> node` belongs to the shell's Space. Two Spaces using the same
+`shell -> npm -> node` belongs to the shell's Space. Two Spaces using the same
 directory remain separate. A service started outside Herdr, a reparented daemon,
 or an incomplete/ambiguous process chain has no assignment. Cwd is display only.
 
@@ -54,10 +54,13 @@ rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status"]]
 [[keys.command]]
 key = "prefix+a"
 type = "plugin_action"
-command = "numbered.ports.open"
+command = "viko16.herdr-ports.open"
 ```
 
 Then `herdr server reload-config`.
+
+If upgrading from version 0.1.2 or earlier, update existing keybindings from
+`numbered.ports.open` to `viko16.herdr-ports.open` to match the new plugin ID.
 
 ## Popup
 
@@ -148,7 +151,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
 Tests mock Herdr, sockets, process tables, kernel identity/environment, clock and
 sleep in temporary fixtures. They do not create panes or inspect/stop real services.
-Coverage includes shell/tnpm/node ancestry, same-directory Spaces, external
+Coverage includes shell/npm/node ancestry, same-directory Spaces, external
 services, reparenting, plugin descendants and inherited context, ordinary Sidebar
 labels, cleared environments, broken trees, PID reuse, terminal replacement,
 immediate closure, cache refresh, empty scans, failures, singleton locking and TTL.
@@ -171,7 +174,7 @@ private temporary Unix sockets and need local socket permission.
 ## CLI
 
 ```sh
-herdr plugin action invoke open --plugin numbered.ports   # open the popup
+herdr plugin action invoke open --plugin viko16.herdr-ports # open the popup
 ./herdr-ports list                                        # one-shot table
 ./herdr-ports watch                                       # run the poller in foreground
 ```
