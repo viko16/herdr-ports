@@ -104,6 +104,8 @@ if name == "python3":
 elif name == "uname":
     print(cfg.get("platform", "Darwin"))
 elif name == "netstat":
+    if cfg.get("netstat_empty"):
+        sys.exit(0)
     if tick in cfg.get("scan_fail", []):
         sys.exit(1)
     if value("listeners", True):
@@ -255,6 +257,19 @@ class WatchTests(unittest.TestCase):
         calls = self.run_watch(path, env)
         self.assertTrue(all(t == 3 for t, n, _ in calls if n in ("herdr", "ps", "rpc")))
         self.assertEqual(sum(n == "python3" for _, n, _ in calls), 5)
+
+    def test_empty_netstat_falls_back_to_lsof(self):
+        path, env = self.fixture(polls=3, netstat_empty=True, listeners=[[2, False]])
+        calls = self.run_watch(path, env)
+        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0])
+        self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
+        self.assertEqual(sum(n == "lsof" for _, n, _ in calls), 3)
+
+    def test_empty_netstat_and_failed_lsof_preserve_leases(self):
+        path, env = self.fixture(polls=3, netstat_empty=True, scan_fail=[1])
+        calls = self.run_watch(path, env)
+        self.assertEqual(self.reports(calls, True), [])
+        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0, 2, 2])
 
     def test_snapshot_failures_preserve_leases_and_retry(self):
         for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response", "ps_fail"):

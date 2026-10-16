@@ -45,19 +45,28 @@ ACCENT="${HERDR_PORTS_ACCENT:-223}"
 # inet_diag. lsof remains the universal fallback.
 pid_ports() (
 	set -o pipefail
-	if [ "$(uname 2> /dev/null)" = Darwin ] && command -v netstat > /dev/null 2>&1; then
+	local output status=0 platform
+	platform=$(uname 2> /dev/null)
+	if [ "$platform" = Darwin ] && command -v netstat > /dev/null 2>&1; then
 		# The process:pid token is located from the right: macOS addresses put
 		# a "." before the port, so a field ending in ":digits" can only be
 		# process:pid - immune to process names containing spaces or dots
-		netstat -anv -p tcp 2> /dev/null | awk '
+		output=$(netstat -anv -p tcp 2> /dev/null | awk '
 			$6 == "LISTEN" {
 				port = $4; sub(/.*\./, "", port)
 				pid = ""
 				for (i = NF; i > 0; i--) if ($i ~ /:[0-9]+$/) { pid = $i; sub(/.*:/, "", pid); break }
 				if (port ~ /^[0-9]+$/ && pid ~ /^[0-9]+$/) print pid "\t" port
 			}
-		' | sort -u
-	elif [ -d /proc ] && command -v ss > /dev/null 2>&1; then
+		' | sort -u) || status=$?
+		# macOS 27 can return success with no TCP rows. Fall back even on
+		# command failure, but never accept partial output from a failed dump.
+		if [ "$status" -eq 0 ] && [ -n "$output" ]; then
+			printf '%s\n' "$output"
+			return 0
+		fi
+	fi
+	if [ "$platform" = Linux ] && command -v ss > /dev/null 2>&1; then
 		ss -ltnpH 2> /dev/null | awk '
 			{
 				port = $4; sub(/.*:/, "", port)
@@ -69,7 +78,7 @@ pid_ports() (
 		' | sort -u
 	elif command -v lsof > /dev/null 2>&1; then
 		# lsof uses status 1 with no output for a successful empty selection.
-		local output status=0
+		status=0
 		output=$(lsof -nP -iTCP -sTCP:LISTEN -Fpn 2>&1) || status=$?
 		[ "$status" -eq 1 ] && [ -z "$output" ] && return 0
 		[ "$status" -le 1 ] || return "$status"
