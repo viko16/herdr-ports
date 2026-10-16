@@ -131,6 +131,10 @@ watch_singleton() {
 	self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 	# Keep the inode: unlinking a locked file lets a new opener take a second
 	# lock. Kernel ownership handles crashes and PID reuse without signalling.
+	# The key is the user plus actual socket path, not the session display name.
+	# Children inherit the descriptor: ownership lasts until the last closes it.
+	# A running watcher has sourced these functions; updating the file or
+	# reloading Herdr does not replace them. Restart that watcher to load changes.
 	exec perl -MFcntl=:DEFAULT,:flock,F_SETFD -MDigest::SHA=sha256_hex -e '
 		my ($script, $socket) = @ARGV;
 		my $dir = "/tmp/herdr-ports-watch-$<";
@@ -155,13 +159,15 @@ watch_loop() {
 	# The TTL is only a backstop (a missed poll must not flicker the badge, and a
 	# dead watcher must still let the badge lapse). The fast path is an explicit
 	# diff: any Space that lost its last listener since the previous poll gets a
-	# clear immediately, so a server killed outside the popup drops its badge
+	# clear immediately, so a stopped server drops its badge
 	# within one INTERVAL instead of waiting out the TTL.
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
 	validate_watch_options || return $?
 	local renew=$((INTERVAL * 2)) ttl=$(((INTERVAL * 3 + 10) * 1000))
+	# Renew every two intervals; TTL tolerates another interval plus 10 seconds.
+	# Global read failures preserve leases; failed writes retry independently.
 	local ws now cur rows list oldlist previous leases='' next last known stamp cache_dir ops successes
 	cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-watch.XXXXXX") || return 1
 	trap 'exit 0' TERM INT HUP

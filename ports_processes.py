@@ -163,10 +163,15 @@ class KernelProcesses:
 
 def plugin_environment(env):
     # Herdr plugin invocation context, also inherited by ordinary children.
+    # Herdr 0.9.0 has no queryable plugin-pane inventory. Read NUL-delimited
+    # kernel environment, never argv or pane labels, to identify this context.
     return any(key in env for key in (b"HERDR_PLUGIN_ROOT", b"HERDR_PLUGIN_STATE_DIR"))
 
 
 def pane_shells(snapshot, table, kernel, cache, now, read_api=api):
+    # The watcher owns this cache; it stores shell identity only, never cwd or
+    # environment. New terminal IDs query immediately; stable ones revalidate
+    # via RPC every five minutes. Kernel identity is still checked every scan.
     panes = snapshot["panes"]
     if not isinstance(panes, list):
         raise ValueError("missing pane inventory")
@@ -282,6 +287,8 @@ def scan(listeners, cache, now, read_api=api, read_table=process_table, kernel=N
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         if not unknown_on_error:
             raise  # Watcher must preserve leases on a failed global read.
+        # Read-only list output keeps socket rows visible as unassigned even
+        # when Herdr is unavailable. Cwd lookup failure is display-only too.
         return {}, table, {"workspaces": []}
 
 
