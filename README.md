@@ -59,6 +59,16 @@ command = "viko16.herdr-ports.open"
 
 Then `herdr server reload-config`.
 
+To show the actual ports too (for example, `:3000 :5173`), add `$portlist`:
+
+```toml
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status", "$portlist"]]
+```
+
+Port lists are sorted and deduplicated. They update on the next poll when ports
+change, and clear together with the badge when the last listener disappears.
+
 If upgrading from version 0.1.2 or earlier, update existing keybindings from
 `numbered.ports.open` to `viko16.herdr-ports.open` to match the new plugin ID.
 

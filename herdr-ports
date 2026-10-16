@@ -127,6 +127,11 @@ active_workspaces() (
 	pid_ports | python3 "$PROCESS_HELPER" active "${1:--}" "${2:-$(date +%s)}"
 )
 
+workspace_ports() (
+	set -o pipefail
+	pid_ports | python3 "$PROCESS_HELPER" workspace-ports "${1:--}" "${2:-$(date +%s)}"
+)
+
 validate_watch_options() {
 	case "$INTERVAL" in
 		'' | 0* | *[!0-9]*) echo 'poll interval must be an integer from 1 to 3600 seconds' >&2; return 2 ;;
@@ -174,12 +179,12 @@ watch_loop() {
 	# counter restarting at 1 would never show again.
 	validate_watch_options || return $?
 	local renew=$((INTERVAL * 2)) ttl=$(((INTERVAL * 3 + 10) * 1000))
-	local ws now cur leases='' next last known stamp cache_dir ops successes
+	local ws now cur rows list oldlist previous leases='' next last known stamp cache_dir ops successes
 	cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-watch.XXXXXX") || return 1
 	trap 'exit 0' TERM INT HUP
 	while :; do
 		now=$(date +%s)
-		if ! cur=$(active_workspaces "$cache_dir/shells.json" "$now"); then
+		if ! rows=$(workspace_ports "$cache_dir/shells.json" "$now"); then
 			# Failed reads preserve leases; retry next poll, TTL is the backstop.
 			sleep "$INTERVAL" || return 1
 			continue
@@ -189,16 +194,20 @@ watch_loop() {
 		# helper invocation. Each workspace still uses its own Herdr socket
 		# connection, matching the server's one-request-per-connection protocol.
 		ops=''
-		for ws in $cur; do
-			last=''
-			while read -r known stamp; do
-				if [ "$known" = "$ws" ]; then last=$stamp; break; fi
+		cur=''
+		while IFS=$'\t' read -r ws list; do
+			[ -n "$ws" ] || continue
+			cur="$cur$ws"$'\n'
+			last='' oldlist=''
+			while read -r known stamp previous; do
+				if [ "$known" = "$ws" ]; then last=$stamp; oldlist=$previous; break; fi
 			done <<< "$leases"
-			if [ -z "$last" ] || [ "$now" -lt "$last" ] || [ "$((now - last))" -ge "$renew" ]; then
-				ops="$ops"$'set\t'"$ws"$'\n'
+			# Port changes publish on this poll, even before lease renewal.
+			if [ "$list" != "$oldlist" ] || [ -z "$last" ] || [ "$now" -lt "$last" ] || [ "$((now - last))" -ge "$renew" ]; then
+				ops="$ops"$'set\t'"$ws"$'\t'"$list"$'\n'
 			fi
-		done
-		while read -r ws last; do
+		done <<< "$rows"
+		while read -r ws last oldlist; do
 			[ -n "$ws" ] || continue
 			case $'\n'"$cur"$'\n' in *$'\n'"$ws"$'\n'*) continue ;; esac
 			ops="$ops"$'clear\t'"$ws"$'\n'
@@ -210,24 +219,27 @@ watch_loop() {
 		fi
 
 		next=''
-		for ws in $cur; do
-			last=''
-			while read -r known stamp; do
-				if [ "$known" = "$ws" ]; then last=$stamp; break; fi
+		while IFS=$'\t' read -r ws list; do
+			[ -n "$ws" ] || continue
+			last='' oldlist=''
+			while read -r known stamp previous; do
+				if [ "$known" = "$ws" ]; then last=$stamp; oldlist=$previous; break; fi
 			done <<< "$leases"
-			if [ -z "$last" ] || [ "$now" -lt "$last" ] || [ "$((now - last))" -ge "$renew" ]; then
-				case $'\n'"$successes"$'\n' in *$'\n'"set $ws"$'\n'*) last=$now ;; esac
-			fi
+			case $'\n'"$successes"$'\n' in
+				*$'\n'"set $ws"$'\n'*) last=$now; oldlist=$list ;;
+				*) [ "$list" = "$oldlist" ] || last=0 ;;
+			esac
 			# Also remember failed first posts: a lost response may have applied.
-			next="$next$ws ${last:-0}"$'\n'
-		done
-		while read -r ws last; do
+			# Keep the last acknowledged list on failure so changes retry.
+			next="$next$ws ${last:-0} $oldlist"$'\n'
+		done <<< "$rows"
+		while read -r ws last oldlist; do
 			[ -n "$ws" ] || continue
 			case $'\n'"$cur"$'\n' in *$'\n'"$ws"$'\n'*) continue ;; esac
 			case $'\n'"$successes"$'\n' in
 				*$'\n'"clear $ws"$'\n'*) continue ;;
 			esac
-			next="$next$ws $last"$'\n'
+			next="$next$ws $last $oldlist"$'\n'
 		done <<< "$leases"
 		leases=$next
 		sleep "$INTERVAL" || return 1

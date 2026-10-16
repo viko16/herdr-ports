@@ -33,7 +33,7 @@ def table():
                      f"{424242+i} {20000+i} node /shared/server.js"])
     return value("processes", "\n".join(rows))
 def sockets():
-    return cfg.get("sockets", [[424242+i, 3000+i] for i in range(cfg.get("workspaces", 2))])
+    return value("socket_changes", cfg.get("sockets", [[424242+i, 3000+i] for i in range(cfg.get("workspaces", 2))]))
 if name == "python3":
     import importlib.util, io
     spec = importlib.util.spec_from_file_location("ports_processes", sys.argv[1])
@@ -239,7 +239,8 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([t for t, _ in self.reports(calls)][::20], [0, 2, 4, 6])
         for _, params in self.reports(calls):
             self.assertEqual(params["source"], "ports")
-            self.assertEqual(params["tokens"], {"ports": "↯"})
+            port = 3000 + int(params["workspace_id"][1:])
+            self.assertEqual(params["tokens"], {"ports": "↯", "portlist": f":{port}"})
             self.assertEqual(params["ttl_ms"], 25000)
         # Include the singleton launcher's absolute Bash exec, not only PATH.
         self.assertEqual(sum(n not in ("rpc", "metadata_rpc") for _, n, _ in calls) + 1, 65)
@@ -252,7 +253,9 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len(before) + 1, 208)
         self.assertEqual(sum(n == "herdr" and a[:1] == ["api"] for _, n, a in before), 7)
         self.assertEqual(sum(n == "herdr" and a[:1] == ["pane"] for _, n, a in before), 60)
-        self.assertEqual(self.reports(before), self.reports(calls))
+        without_portlist = [(tick, dict(params, tokens={"ports": params["tokens"]["ports"]}))
+                            for tick, params in self.reports(calls)]
+        self.assertEqual(self.reports(before), without_portlist)
         print("\n7 polls / 20 panes: external exec 208 -> 65; API reads 67 -> 27 plus 80 socket metadata writes.")
 
     def test_idle_polls_do_not_read_herdr_or_processes(self):
@@ -335,6 +338,25 @@ class WatchTests(unittest.TestCase):
         calls = self.run_watch(path, env)
         self.assertEqual([t for t, _ in self.reports(calls, True)], [1, 1, 2, 2])
         self.assertEqual([t for t, _ in self.reports(calls)], [0, 0, 3, 3, 4, 4])
+        for _, params in self.reports(calls, True):
+            self.assertEqual(params["tokens"], {"ports": None, "portlist": None})
+
+    def test_portlist_changes_retry_without_waiting_for_renewal(self):
+        path, env = self.fixture(polls=5, workspaces=1, post_fail=[1],
+            socket_changes=[[1, [[424242, 8080], [424242, 80], [424242, 8080]]],
+                            [3, [[424242, 80]]], [4, []]])
+        calls = self.run_watch(path, env)
+        reports = self.reports(calls)
+        self.assertEqual([(tick, p["tokens"]["portlist"]) for tick, p in reports],
+                         [(0, ":3000"), (1, ":80 :8080"), (2, ":80 :8080"), (3, ":80")])
+        self.assertEqual([(t, p["tokens"]) for t, p in self.reports(calls, True)],
+                         [(4, {"ports": None, "portlist": None})])
+
+    def test_portlist_keeps_spaces_separate_and_excludes_external_listeners(self):
+        path, env = self.fixture(polls=1, sockets=[[424242, 3000], [424243, 8080], [999999, 9000]])
+        reports = self.reports(self.run_watch(path, env))
+        self.assertEqual({p["workspace_id"]: p["tokens"]["portlist"] for _, p in reports},
+                         {"w0": ":3000", "w1": ":8080"})
 
     def test_failed_renewal_retries_next_poll(self):
         path, env = self.fixture(polls=5, post_fail=[0, 3])

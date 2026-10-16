@@ -46,11 +46,11 @@ def api(*args):
     return rpc(method, params)
 
 
-def report_metadata(workspace_id, value, seq, ttl_ms=None):
+def report_metadata(workspace_id, value, seq, ttl_ms=None, portlist=None):
     params = {
         "workspace_id": workspace_id,
         "source": "ports",
-        "tokens": {"ports": value},
+        "tokens": {"ports": value, "portlist": portlist},
         "seq": seq,
     }
     if ttl_ms is not None:
@@ -69,19 +69,22 @@ def metadata_batch(lines, timestamp, ttl_raw, badge):
         raw = raw.rstrip("\n")
         if not raw:
             continue
-        operation, workspace_id = raw.split("\t", 1)
+        fields = raw.split("\t")
+        operation, workspace_id = fields[:2]
         if not workspace_id:
             raise ValueError("missing workspace id")
         if operation == "set":
-            if ttl_ms is None:
-                raise ValueError("set operation requires ttl")
+            if ttl_ms is None or len(fields) != 3 or not fields[2]:
+                raise ValueError("set operation requires ttl and port list")
             value, ttl = badge, ttl_ms
+            portlist = fields[2]
         elif operation == "clear":
             value, ttl = None, None
+            portlist = None
         else:
             raise ValueError("invalid metadata operation")
         try:
-            report_metadata(workspace_id, value, seq, ttl)
+            report_metadata(workspace_id, value, seq, ttl, portlist)
         except (OSError, ValueError, KeyError, TypeError):
             continue
         print(f"{operation} {workspace_id}")
@@ -282,6 +285,16 @@ def scan(listeners, cache, now, read_api=api, read_table=process_table, kernel=N
         return {}, table, {"workspaces": []}
 
 
+def workspace_ports(ports, assigned):
+    # Aggregate only confirmed owners; deduplicate IPv4/IPv6 and shared ports
+    # across processes, then sort numerically (80 before 3000).
+    grouped = {}
+    for pid, workspace in assigned.items():
+        grouped.setdefault(workspace, set()).update(ports[pid])
+    return {workspace: " ".join(f":{port}" for port in sorted(numbers))
+            for workspace, numbers in sorted(grouped.items())}
+
+
 def display_rows(ports, assigned, table, snapshot, cwds):
     labels = {w["workspace_id"]: w.get("label") or w["workspace_id"] for w in snapshot["workspaces"]}
     for pid in sorted(ports, key=lambda p: (assigned.get(p, "~"), min(ports[p]), p)):
@@ -316,6 +329,9 @@ def main():
         pending.replace(cache_path)
     if mode == "active":
         print("\n".join(sorted(set(assigned.values()))))
+    elif mode == "workspace-ports":
+        for workspace, portlist in workspace_ports(ports, assigned).items():
+            print(f"{workspace}\t{portlist}")
     elif mode == "rows":
         cwds = {}
         for line in Path(files[0]).read_text().splitlines():
