@@ -104,6 +104,9 @@ if name == "python3":
 elif name == "uname":
     print(cfg.get("platform", "Darwin"))
 elif name == "netstat":
+    if "netstat_output" in cfg:
+        print(cfg["netstat_output"])
+        sys.exit(0)
     if cfg.get("netstat_empty"):
         sys.exit(0)
     if tick in cfg.get("scan_fail", []):
@@ -264,6 +267,18 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([t for t, _ in self.reports(calls)], [0, 0])
         self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
         self.assertEqual(sum(n == "lsof" for _, n, _ in calls), 3)
+
+    def test_numeric_and_named_netstat_pid_formats(self):
+        for output in (
+            "Proto Recv-Q Send-Q Local Address Foreign Address (state) rxbytes txbytes rhiwat shiwat pid epid\n"
+            "tcp4 0 0 127.0.0.1.3000 *.* LISTEN 0 0 131072 131072 424242 0",
+            "tcp6 0 0 ::1.3000 *.* LISTEN 0 0 app with spaces:424242 0",
+        ):
+            with self.subTest(output=output):
+                path, env = self.fixture(polls=1, workspaces=1, netstat_output=output)
+                calls = self.run_watch(path, env)
+                self.assertEqual(len(self.reports(calls)), 1)
+                self.assertFalse(any(n == "lsof" for _, n, _ in calls))
 
     def test_empty_netstat_and_failed_lsof_preserve_leases(self):
         path, env = self.fixture(polls=3, netstat_empty=True, scan_fail=[1])

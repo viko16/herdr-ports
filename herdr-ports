@@ -52,10 +52,14 @@ pid_ports() (
 		# a "." before the port, so a field ending in ":digits" can only be
 		# process:pid - immune to process names containing spaces or dots
 		output=$(netstat -anv -p tcp 2> /dev/null | awk '
+			# macOS 15 uses a numeric pid column. Address headers each take
+			# two words but their data takes one field, hence the -2 offset.
+			$1 == "Proto" { for (i = 1; i <= NF; i++) if ($i == "pid") pidcol = i - 2; next }
 			$6 == "LISTEN" {
 				port = $4; sub(/.*\./, "", port)
 				pid = ""
 				for (i = NF; i > 0; i--) if ($i ~ /:[0-9]+$/) { pid = $i; sub(/.*:/, "", pid); break }
+				if (pid == "" && pidcol > 0) pid = $pidcol
 				if (port ~ /^[0-9]+$/ && pid ~ /^[0-9]+$/) print pid "\t" port
 			}
 		' | sort -u) || status=$?
