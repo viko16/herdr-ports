@@ -1,7 +1,7 @@
 # herdr-ports
 
 Show which Space started a listening service in [herdr](https://herdr.dev):
-a generic `$ports` badge (`↯`) and a popup to inspect and stop TCP listeners.
+a generic `$ports` badge (`↯`) and a port list in the sidebar.
 
 A listener is assigned only when its live parent chain reaches a terminal
 `shell_pid` reported by Herdr for that Space. For example,
@@ -9,8 +9,8 @@ A listener is assigned only when its live parent chain reaches a terminal
 directory remain separate. A service started outside Herdr, a reparented daemon,
 or an incomplete/ambiguous process chain has no assignment. Cwd is display only.
 
-The popup and badge use the same resolver. The default popup shows assigned
-listeners; `all` includes unknown and plugin listeners with Space `-`.
+The read-only `list` command and badge use the same resolver.
+The command includes unknown and plugin listeners with Space `-`.
 The original command display is kept (first 60 characters), from the same
 batch process table used for ancestry.
 
@@ -50,11 +50,6 @@ your `config.toml`:
 [ui.sidebar.spaces]
 rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status"]]
 
-# Open the popup with prefix+a
-[[keys.command]]
-key = "prefix+a"
-type = "plugin_action"
-command = "viko16.herdr-ports.open"
 ```
 
 Then `herdr server reload-config`.
@@ -69,31 +64,9 @@ rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status", "$portli
 Port lists are sorted and deduplicated. They update on the next poll when ports
 change, and clear together with the badge when the last listener disappears.
 
-If upgrading from version 0.1.2 or earlier, update existing keybindings from
-`numbered.ports.open` to `viko16.herdr-ports.open` to match the new plugin ID.
-
-## Popup
-
-```
-      SPACE        PORTS          PID     PATH                           COMMAND
-> [ ] webapp       :3000          48213   ~/dev/webapp                   next-server (v16)
-  [x] api          :8080          48377   ~/dev/api                      bun run src/index.ts
-
-  ↑↓ move · space check · a all · r refresh
-                ↵ kill    esc close
-```
-
-The footer mimics herdr's native settings modal: a dim hint line (replaced by
-the outcome of the last kill), then CTA chips - accent `↵ kill`, gray
-`esc close`. Set `HERDR_PORTS_ACCENT` (256-color index, default 223) to match
-your theme's accent. Hints and chips are all clickable. Mouse: click a row to
-check it, use the wheel to move. Keyboard:
-
-- arrows / `j` `k`: move - `space`: check - `enter`: kill checked rows (or the
-  highlighted one when none checked); TERM, then the list redraws the instant
-  the targets exit (stragglers get KILL in the background), and the Space's
-  `$ports` badge clears right away instead of waiting out the metadata TTL
-- `a`: include listeners outside herdr workspaces - `r`: refresh - `esc` / `q`: quit
+If you previously configured the popup shortcut, remove its `[[keys.command]]`
+entry (`numbered.ports.open` or `viko16.herdr-ports.open`); the popup is no longer
+available. The `list` command remains read-only.
 
 ## How the badge works
 
@@ -140,8 +113,8 @@ intervals, with a TTL of three intervals plus 10s (25s by default). Confirmed
 loss of attribution clears on the next poll. Failed socket/table/API reads
 preserve lease state without posting or clearing and retry on the next poll;
 a prolonged outage falls back to TTL. An inaccessible individual process is
-unassigned. The popup treats failed attribution reads as unknown and keeps the
-socket rows available in its all view. A cwd read failure affects display only.
+unassigned. The list command treats failed attribution reads as unknown and keeps the
+socket rows available in its output. A cwd read failure affects display only.
 
 The singleton uses a kernel file lock keyed by user and `HERDR_SOCKET_PATH`
 (default `${XDG_CONFIG_HOME:-$HOME/.config}/herdr/herdr.sock`). Different socket
@@ -177,14 +150,13 @@ CLI launches (seven snapshots and sixty shell lookups). The watcher does not rea
 cwds. The count excludes shell builtins, subshells, in-process kernel/file reads and
 the test harness; it is not a CPU/time benchmark. More panes add one shell RPC each
 on discovery and five-minute fallback. Metadata renewal adds socket RPCs but no
-per-workspace executable launch. The popup also makes one batch cwd read on macOS
+per-workspace executable launch. The list command also makes one batch cwd read on macOS
 and uses the same resolver without retaining shell mappings. Socket tests bind
 private temporary Unix sockets and need local socket permission.
 
 ## CLI
 
 ```sh
-herdr plugin action invoke open --plugin viko16.herdr-ports # open the popup
 ./herdr-ports list                                        # one-shot table
 ./herdr-ports watch                                       # run the poller in foreground
 ```

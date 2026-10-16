@@ -246,7 +246,7 @@ class AncestryTests(unittest.TestCase):
             ports.display_rows({30: {3000}}, {}, self.table, {"workspaces": []}, {30: "/shared"})
         self.assertEqual(output.getvalue(), "-\t30\t:3000\t/shared\t" + command[:60] + "\n")
 
-    def test_failed_api_preserves_watcher_failure_but_popup_shows_unknown(self):
+    def test_failed_api_preserves_watcher_failure_but_list_shows_unknown(self):
         def failed_api(*args):
             raise OSError("unavailable")
         with self.assertRaises(OSError):

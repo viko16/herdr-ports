@@ -174,6 +174,15 @@ else:
 
 
 class WatchTests(unittest.TestCase):
+    def test_no_argument_and_help_are_read_only(self):
+        for args in ([], ["--help"], ["-h"]):
+            path, env = self.fixture()
+            result = subprocess.run(["/bin/bash", str(SCRIPT)] + args, env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "usage: herdr-ports [list|watch|ensure-watch]\n")
+            self.assertEqual(self.calls(path), [])
+
     def fixture(self, **config):
         # Leave temporary fixtures to the OS; never delete via rm/rmtree.
         path = Path(tempfile.mkdtemp(prefix="herdr-ports-test-"))

@@ -327,9 +327,7 @@ def main():
         pending = Path(cache_path + ".new")
         pending.write_text(json.dumps(cache))
         pending.replace(cache_path)
-    if mode == "active":
-        print("\n".join(sorted(set(assigned.values()))))
-    elif mode == "workspace-ports":
+    if mode == "workspace-ports":
         for workspace, portlist in workspace_ports(ports, assigned).items():
             print(f"{workspace}\t{portlist}")
     elif mode == "rows":
