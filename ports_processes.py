@@ -46,11 +46,11 @@ def api(*args):
     return rpc(method, params)
 
 
-def report_metadata(workspace_id, value, seq, ttl_ms=None):
+def report_metadata(workspace_id, value, seq, ttl_ms=None, portlist=None):
     params = {
         "workspace_id": workspace_id,
         "source": "ports",
-        "tokens": {"ports": value},
+        "tokens": {"ports": value, "portlist": portlist},
         "seq": seq,
     }
     if ttl_ms is not None:
@@ -69,19 +69,22 @@ def metadata_batch(lines, timestamp, ttl_raw, badge):
         raw = raw.rstrip("\n")
         if not raw:
             continue
-        operation, workspace_id = raw.split("\t", 1)
+        fields = raw.split("\t")
+        operation, workspace_id = fields[:2]
         if not workspace_id:
             raise ValueError("missing workspace id")
         if operation == "set":
-            if ttl_ms is None:
-                raise ValueError("set operation requires ttl")
+            if ttl_ms is None or len(fields) != 3 or not fields[2]:
+                raise ValueError("set operation requires ttl and port list")
             value, ttl = badge, ttl_ms
+            portlist = fields[2]
         elif operation == "clear":
             value, ttl = None, None
+            portlist = None
         else:
             raise ValueError("invalid metadata operation")
         try:
-            report_metadata(workspace_id, value, seq, ttl)
+            report_metadata(workspace_id, value, seq, ttl, portlist)
         except (OSError, ValueError, KeyError, TypeError):
             continue
         print(f"{operation} {workspace_id}")
@@ -160,10 +163,15 @@ class KernelProcesses:
 
 def plugin_environment(env):
     # Herdr plugin invocation context, also inherited by ordinary children.
+    # Herdr 0.9.0 has no queryable plugin-pane inventory. Read NUL-delimited
+    # kernel environment, never argv or pane labels, to identify this context.
     return any(key in env for key in (b"HERDR_PLUGIN_ROOT", b"HERDR_PLUGIN_STATE_DIR"))
 
 
 def pane_shells(snapshot, table, kernel, cache, now, read_api=api):
+    # The watcher owns this cache; it stores shell identity only, never cwd or
+    # environment. New terminal IDs query immediately; stable ones revalidate
+    # via RPC every five minutes. Kernel identity is still checked every scan.
     panes = snapshot["panes"]
     if not isinstance(panes, list):
         raise ValueError("missing pane inventory")
@@ -279,7 +287,19 @@ def scan(listeners, cache, now, read_api=api, read_table=process_table, kernel=N
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         if not unknown_on_error:
             raise  # Watcher must preserve leases on a failed global read.
+        # Read-only list output keeps socket rows visible as unassigned even
+        # when Herdr is unavailable. Cwd lookup failure is display-only too.
         return {}, table, {"workspaces": []}
+
+
+def workspace_ports(ports, assigned):
+    # Aggregate only confirmed owners; deduplicate IPv4/IPv6 and shared ports
+    # across processes, then sort numerically (80 before 3000).
+    grouped = {}
+    for pid, workspace in assigned.items():
+        grouped.setdefault(workspace, set()).update(ports[pid])
+    return {workspace: " ".join(f":{port}" for port in sorted(numbers))
+            for workspace, numbers in sorted(grouped.items())}
 
 
 def display_rows(ports, assigned, table, snapshot, cwds):
@@ -314,8 +334,9 @@ def main():
         pending = Path(cache_path + ".new")
         pending.write_text(json.dumps(cache))
         pending.replace(cache_path)
-    if mode == "active":
-        print("\n".join(sorted(set(assigned.values()))))
+    if mode == "workspace-ports":
+        for workspace, portlist in workspace_ports(ports, assigned).items():
+            print(f"{workspace}\t{portlist}")
     elif mode == "rows":
         cwds = {}
         for line in Path(files[0]).read_text().splitlines():

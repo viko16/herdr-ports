@@ -33,7 +33,7 @@ def table():
                      f"{424242+i} {20000+i} node /shared/server.js"])
     return value("processes", "\n".join(rows))
 def sockets():
-    return cfg.get("sockets", [[424242+i, 3000+i] for i in range(cfg.get("workspaces", 2))])
+    return value("socket_changes", cfg.get("sockets", [[424242+i, 3000+i] for i in range(cfg.get("workspaces", 2))]))
 if name == "python3":
     import importlib.util, io
     spec = importlib.util.spec_from_file_location("ports_processes", sys.argv[1])
@@ -104,6 +104,11 @@ if name == "python3":
 elif name == "uname":
     print(cfg.get("platform", "Darwin"))
 elif name == "netstat":
+    if "netstat_output" in cfg:
+        print(cfg["netstat_output"])
+        sys.exit(0)
+    if cfg.get("netstat_empty"):
+        sys.exit(0)
     if tick in cfg.get("scan_fail", []):
         sys.exit(1)
     if value("listeners", True):
@@ -169,6 +174,15 @@ else:
 
 
 class WatchTests(unittest.TestCase):
+    def test_no_argument_and_help_are_read_only(self):
+        for args in ([], ["--help"], ["-h"]):
+            path, env = self.fixture()
+            result = subprocess.run(["/bin/bash", str(SCRIPT)] + args, env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "usage: herdr-ports [list|watch|ensure-watch]\n")
+            self.assertEqual(self.calls(path), [])
+
     def fixture(self, **config):
         # Leave temporary fixtures to the OS; never delete via rm/rmtree.
         path = Path(tempfile.mkdtemp(prefix="herdr-ports-test-"))
@@ -234,7 +248,8 @@ class WatchTests(unittest.TestCase):
         self.assertEqual([t for t, _ in self.reports(calls)][::20], [0, 2, 4, 6])
         for _, params in self.reports(calls):
             self.assertEqual(params["source"], "ports")
-            self.assertEqual(params["tokens"], {"ports": "↯"})
+            port = 3000 + int(params["workspace_id"][1:])
+            self.assertEqual(params["tokens"], {"ports": "↯", "portlist": f":{port}"})
             self.assertEqual(params["ttl_ms"], 25000)
         # Include the singleton launcher's absolute Bash exec, not only PATH.
         self.assertEqual(sum(n not in ("rpc", "metadata_rpc") for _, n, _ in calls) + 1, 65)
@@ -247,7 +262,9 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(len(before) + 1, 208)
         self.assertEqual(sum(n == "herdr" and a[:1] == ["api"] for _, n, a in before), 7)
         self.assertEqual(sum(n == "herdr" and a[:1] == ["pane"] for _, n, a in before), 60)
-        self.assertEqual(self.reports(before), self.reports(calls))
+        without_portlist = [(tick, dict(params, tokens={"ports": params["tokens"]["ports"]}))
+                            for tick, params in self.reports(calls)]
+        self.assertEqual(self.reports(before), without_portlist)
         print("\n7 polls / 20 panes: external exec 208 -> 65; API reads 67 -> 27 plus 80 socket metadata writes.")
 
     def test_idle_polls_do_not_read_herdr_or_processes(self):
@@ -255,6 +272,31 @@ class WatchTests(unittest.TestCase):
         calls = self.run_watch(path, env)
         self.assertTrue(all(t == 3 for t, n, _ in calls if n in ("herdr", "ps", "rpc")))
         self.assertEqual(sum(n == "python3" for _, n, _ in calls), 5)
+
+    def test_empty_netstat_falls_back_to_lsof(self):
+        path, env = self.fixture(polls=3, netstat_empty=True, listeners=[[2, False]])
+        calls = self.run_watch(path, env)
+        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0])
+        self.assertEqual([t for t, _ in self.reports(calls, True)], [2, 2])
+        self.assertEqual(sum(n == "lsof" for _, n, _ in calls), 3)
+
+    def test_numeric_and_named_netstat_pid_formats(self):
+        for output in (
+            "Proto Recv-Q Send-Q Local Address Foreign Address (state) rxbytes txbytes rhiwat shiwat pid epid\n"
+            "tcp4 0 0 127.0.0.1.3000 *.* LISTEN 0 0 131072 131072 424242 0",
+            "tcp6 0 0 ::1.3000 *.* LISTEN 0 0 app with spaces:424242 0",
+        ):
+            with self.subTest(output=output):
+                path, env = self.fixture(polls=1, workspaces=1, netstat_output=output)
+                calls = self.run_watch(path, env)
+                self.assertEqual(len(self.reports(calls)), 1)
+                self.assertFalse(any(n == "lsof" for _, n, _ in calls))
+
+    def test_empty_netstat_and_failed_lsof_preserve_leases(self):
+        path, env = self.fixture(polls=3, netstat_empty=True, scan_fail=[1])
+        calls = self.run_watch(path, env)
+        self.assertEqual(self.reports(calls, True), [])
+        self.assertEqual([t for t, _ in self.reports(calls)], [0, 0, 2, 2])
 
     def test_snapshot_failures_preserve_leases_and_retry(self):
         for failure in ("snapshot_fail", "snapshot_invalid", "snapshot_empty_response", "ps_fail"):
@@ -289,9 +331,17 @@ class WatchTests(unittest.TestCase):
         self.assertIn("node /shared/server.js", result.stdout)
 
     def test_lsof_partial_and_failure(self):
+        # Exercise the macOS branch on Linux too. Hide only /proc from the
+        # shell's directory test; leave every other builtin test unchanged.
+        macos = '''
+function [() {
+    if [[ "$#" = 3 && "$1" = -d && "$2" = /proc ]]; then return 1; fi
+    builtin [ "$@"
+}
+'''
         for partial in ([], [0]):
             path, env = self.fixture(cwd_partial=partial)
-            result = subprocess.run(["/bin/bash", "-c", 'source "$1"; printf "424242\\t3000\\n" | raw_pid_cwds',
+            result = subprocess.run(["/bin/bash", "-c", macos + 'source "$1"; printf "424242\\t3000\\n" | raw_pid_cwds',
                                      "test", str(SCRIPT)], env=env, capture_output=True, text=True, check=True)
             self.assertIn("424242\t/shared", result.stdout)
         path, env = self.fixture(polls=4, platform="Other", scan_partial=True,
@@ -305,6 +355,25 @@ class WatchTests(unittest.TestCase):
         calls = self.run_watch(path, env)
         self.assertEqual([t for t, _ in self.reports(calls, True)], [1, 1, 2, 2])
         self.assertEqual([t for t, _ in self.reports(calls)], [0, 0, 3, 3, 4, 4])
+        for _, params in self.reports(calls, True):
+            self.assertEqual(params["tokens"], {"ports": None, "portlist": None})
+
+    def test_portlist_changes_retry_without_waiting_for_renewal(self):
+        path, env = self.fixture(polls=5, workspaces=1, post_fail=[1],
+            socket_changes=[[1, [[424242, 8080], [424242, 80], [424242, 8080]]],
+                            [3, [[424242, 80]]], [4, []]])
+        calls = self.run_watch(path, env)
+        reports = self.reports(calls)
+        self.assertEqual([(tick, p["tokens"]["portlist"]) for tick, p in reports],
+                         [(0, ":3000"), (1, ":80 :8080"), (2, ":80 :8080"), (3, ":80")])
+        self.assertEqual([(t, p["tokens"]) for t, p in self.reports(calls, True)],
+                         [(4, {"ports": None, "portlist": None})])
+
+    def test_portlist_keeps_spaces_separate_and_excludes_external_listeners(self):
+        path, env = self.fixture(polls=1, sockets=[[424242, 3000], [424243, 8080], [999999, 9000]])
+        reports = self.reports(self.run_watch(path, env))
+        self.assertEqual({p["workspace_id"]: p["tokens"]["portlist"] for _, p in reports},
+                         {"w0": ":3000", "w1": ":8080"})
 
     def test_failed_renewal_retries_next_poll(self):
         path, env = self.fixture(polls=5, post_fail=[0, 3])

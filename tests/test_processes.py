@@ -246,7 +246,7 @@ class AncestryTests(unittest.TestCase):
             ports.display_rows({30: {3000}}, {}, self.table, {"workspaces": []}, {30: "/shared"})
         self.assertEqual(output.getvalue(), "-\t30\t:3000\t/shared\t" + command[:60] + "\n")
 
-    def test_failed_api_preserves_watcher_failure_but_popup_shows_unknown(self):
+    def test_failed_api_preserves_watcher_failure_but_list_shows_unknown(self):
         def failed_api(*args):
             raise OSError("unavailable")
         with self.assertRaises(OSError):
@@ -260,6 +260,12 @@ class AncestryTests(unittest.TestCase):
 
 
 class KernelParsingTests(unittest.TestCase):
+    def test_portlist_aggregates_owned_processes_and_sorts_numerically(self):
+        self.assertEqual(ports.workspace_ports(
+            {10: {3000, 80}, 20: {3000, 443}, 30: {9000}, 40: {8080}},
+            {10: "w1", 20: "w1", 40: "w2"}),
+            {"w1": ":80 :443 :3000", "w2": ":8080"})
+
     def test_mac_argv_boundaries_and_environment(self):
         raw = struct.pack("i", 3) + b"/bin/node\0\0\0node\0HERDR_PLUGIN_ROOT=argument\0server.js\0HERDR_ENV=1\0OTHER=secret\0\0"
         self.assertEqual(ports.mac_environment(raw), {b"HERDR_ENV": b"1", b"OTHER": b"secret"})
