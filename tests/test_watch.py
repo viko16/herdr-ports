@@ -331,9 +331,17 @@ class WatchTests(unittest.TestCase):
         self.assertIn("node /shared/server.js", result.stdout)
 
     def test_lsof_partial_and_failure(self):
+        # Exercise the macOS branch on Linux too. Hide only /proc from the
+        # shell's directory test; leave every other builtin test unchanged.
+        macos = '''
+function [() {
+    if [[ "$#" = 3 && "$1" = -d && "$2" = /proc ]]; then return 1; fi
+    builtin [ "$@"
+}
+'''
         for partial in ([], [0]):
             path, env = self.fixture(cwd_partial=partial)
-            result = subprocess.run(["/bin/bash", "-c", 'source "$1"; printf "424242\\t3000\\n" | raw_pid_cwds',
+            result = subprocess.run(["/bin/bash", "-c", macos + 'source "$1"; printf "424242\\t3000\\n" | raw_pid_cwds',
                                      "test", str(SCRIPT)], env=env, capture_output=True, text=True, check=True)
             self.assertIn("424242\t/shared", result.stdout)
         path, env = self.fixture(polls=4, platform="Other", scan_partial=True,
