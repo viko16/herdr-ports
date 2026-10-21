@@ -57,8 +57,24 @@ directory. Unassigned listeners show `-` in the Space column.
 
 ## Upgrading
 
-Restart the existing watcher after updating (or reboot); a configuration reload
-alone does not reload its code.
+A running watcher keeps using the code it started with. Finish updating the
+plugin files before starting or restarting it; new behavior takes effect only
+after a restart. A configuration reload or restarting Herdr alone does not
+replace the watcher.
+
+To restart manually:
+
+1. Find the watcher with `ps -axo pid=,args= | grep '[h]erdr-ports-watch'`.
+   Check its full plugin path and session before choosing a PID; older installs
+   may have more than one watcher. Leave development servers running.
+2. Run `kill -TERM <PID>` for each confirmed watcher you are replacing, and wait
+   for it and its in-flight helpers to exit.
+3. Open a new terminal pane in the same Herdr session, or run
+   `./herdr-ports ensure-watch` from that session's terminal in the plugin
+   directory.
+
+A reboot followed by opening a Herdr terminal pane also loads the new code.
+Watchers started before this upgrade need this one-time restart too.
 
 The popup has been removed. Delete any old `[[keys.command]]` entry that invokes
 `numbered.ports.open` or `viko16.herdr-ports.open`.

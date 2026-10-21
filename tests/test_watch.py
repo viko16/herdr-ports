@@ -138,6 +138,9 @@ elif name == "ps":
         sys.exit(1)
     print(table())
 elif name == "sleep":
+    if tick == 0:
+        for name in cfg.get("upgrade_files", []):
+            (p / (name + ".next")).replace(p / name)
     time.sleep(cfg.get("delay", 0))
     (p / "tick").write_text(str(tick + 1))
     if cfg.get("descendant") and tick == 0:
@@ -186,7 +189,7 @@ class WatchTests(unittest.TestCase):
     def fixture(self, **config):
         # Leave temporary fixtures to the OS; never delete via rm/rmtree.
         path = Path(tempfile.mkdtemp(prefix="herdr-ports-test-"))
-        commands = ("awk", "sort", "cut", "comm", "id", "cat", "dirname", "basename", "perl", "paste", "readlink", "mktemp")
+        commands = ("awk", "sort", "cut", "comm", "id", "cat", "cp", "dirname", "basename", "perl", "paste", "readlink", "mktemp")
         config["real_commands"] = {name: shutil.which(name) for name in commands}
         (path / "config").write_text(json.dumps(config))
         (path / "tick").write_text("0")
@@ -251,8 +254,10 @@ class WatchTests(unittest.TestCase):
             port = 3000 + int(params["workspace_id"][1:])
             self.assertEqual(params["tokens"], {"ports": "↯", "portlist": f":{port}"})
             self.assertEqual(params["ttl_ms"], 25000)
+        # One startup copy pins the helper; polling adds no executable or RPC.
+        self.assertEqual(counts["cp"], 1)
         # Include the singleton launcher's absolute Bash exec, not only PATH.
-        self.assertEqual(sum(n not in ("rpc", "metadata_rpc") for _, n, _ in calls) + 1, 65)
+        self.assertEqual(sum(n not in ("rpc", "metadata_rpc") for _, n, _ in calls) + 1, 66)
         # Run the same shell-ancestry functionality from the immutable baseline.
         before_path, before_env = self.fixture(polls=7, workspaces=20)
         for name in ("herdr-ports", "ports_processes.py"):
@@ -265,7 +270,47 @@ class WatchTests(unittest.TestCase):
         without_portlist = [(tick, dict(params, tokens={"ports": params["tokens"]["ports"]}))
                             for tick, params in self.reports(calls)]
         self.assertEqual(self.reports(before), without_portlist)
-        print("\n7 polls / 20 panes: external exec 208 -> 65; API reads 67 -> 27 plus 80 socket metadata writes.")
+        print("\n7 polls / 20 panes: external exec 208 -> 66; API reads 67 -> 27 plus 80 socket metadata writes.")
+
+    def test_running_watcher_keeps_startup_code_until_restart(self):
+        path, env = self.fixture(polls=5, workspaces=1, snapshot_fail=[1],
+            socket_changes=[[3, []], [5, [[424242, 8080]]]],
+            upgrade_files=["herdr-ports", "ports_processes.py"])
+        script = path / "herdr-ports"
+        helper = path / "ports_processes.py"
+        script.write_text(SCRIPT.read_text())
+        helper.write_text((ROOT / "ports_processes.py").read_text())
+        # Swap both files after the first poll. The new shell/helper pair uses
+        # a different scan protocol and visibly different metadata on restart.
+        (path / "herdr-ports.next").write_text(
+            script.read_text().replace("workspace-ports", "updated-workspace-ports"))
+        (path / "ports_processes.py.next").write_text(
+            helper.read_text().replace("workspace-ports", "updated-workspace-ports")
+            .replace("value, ttl = badge, ttl_ms", 'value, ttl = badge + "-updated", ttl_ms'))
+
+        calls = self.run_watch(path, env, script)
+        self.assertEqual([(t, p["tokens"]) for t, p in self.reports(calls)],
+                         [(0, {"ports": "↯", "portlist": ":3000"}),
+                          (2, {"ports": "↯", "portlist": ":3000"})])
+        self.assertEqual([(t, p["tokens"]) for t, p in self.reports(calls, True)],
+                         [(3, {"ports": None, "portlist": None})])
+        self.assertIn("updated-workspace-ports", script.read_text())
+        self.assertIn("updated-workspace-ports", helper.read_text())
+
+        restarted = self.run_watch(path, env, script)[len(calls):]
+        self.assertEqual([(t, p["tokens"]) for t, p in self.reports(restarted)],
+                         [(5, {"ports": "↯-updated", "portlist": ":8080"})])
+
+    def test_missing_helper_stops_before_polling(self):
+        path, env = self.fixture()
+        script = path / "herdr-ports"
+        script.write_text(SCRIPT.read_text())
+        result = subprocess.run(["/bin/bash", str(script), "watch"], env=env,
+                                capture_output=True, text=True, timeout=5)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ports_processes.py", result.stderr)
+        self.assertFalse(any(n in ("python3", "netstat", "lsof", "rpc", "sleep")
+                             for _, n, _ in self.calls(path)))
 
     def test_idle_polls_do_not_read_herdr_or_processes(self):
         path, env = self.fixture(polls=4, listeners=[[0, False], [3, True]])

@@ -170,6 +170,11 @@ watch_loop() {
 	# Global read failures preserve leases; failed writes retry independently.
 	local ws now cur rows list oldlist previous leases='' next last known stamp cache_dir ops successes
 	cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-watch.XXXXXX") || return 1
+	# These Bash functions stay in memory. Pin the helper to the same startup
+	# version so updating the plugin cannot change its protocol mid-run.
+	# Start/restart only after the update finishes; new code needs a restart.
+	cp "$PROCESS_HELPER" "$cache_dir/ports_processes.py" || return 1
+	local PROCESS_HELPER="$cache_dir/ports_processes.py"
 	trap 'exit 0' TERM INT HUP
 	while :; do
 		now=$(date +%s)
